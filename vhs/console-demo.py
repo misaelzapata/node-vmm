@@ -7,7 +7,7 @@ import sys
 import time
 
 
-def type_bytes(fd: int, data: bytes, delay: float = 0.022) -> None:
+def type_bytes(fd: int, data: bytes, delay: float = 0.034) -> None:
     for byte in data:
         os.write(fd, bytes([byte]))
         time.sleep(delay)

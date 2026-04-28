@@ -15,4 +15,4 @@ Type@1ms "./vhs/launch.expect"
 Enter
 Sleep 500ms
 Show
-Sleep 35s
+Sleep 42s

@@ -12,10 +12,10 @@ proc sh {cmd} {
 proc type_line {text} {
   foreach char [split $text ""] {
     send_user -- $char
-    after 14
+    after 30
   }
   send_user "\n"
-  after 180
+  after 550
 }
 
 proc run_wait {display cmd pattern} {
@@ -37,7 +37,7 @@ proc run_wait {display cmd pattern} {
     send_user "\nDid not see expected output: $pattern\n"
     exit 1
   }
-  after 250
+  after 850
 }
 
 sh "rm -rf $base && mkdir -p $base/repo/app $base/bin"
@@ -64,6 +64,7 @@ run_wait "node-vmm features | sed -n '1,8p'" "node-vmm features | sed -n '1,8p'"
 
 type_line "$ export NODE_VMM_KERNEL=\$(node-vmm kernel fetch)"
 set env(NODE_VMM_KERNEL) [string trim [exec node "$root/dist/src/main.js" kernel fetch]]
+after 850
 
 run_wait \
   "sudo -n node-vmm build --repo file://$base/repo --subdir app --output $base/node.ext4 --disk 2048 --interactive" \
