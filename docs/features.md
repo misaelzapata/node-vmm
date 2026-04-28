@@ -8,7 +8,7 @@ work in progress.
 | --- | --- | --- |
 | ESM TypeScript/JavaScript SDK | Available | Default export plus named exports and subpath exports. |
 | CLI | Available | `node-vmm run`, `build`, `boot`, `code`, `snapshot`, `kernel`, `doctor`. |
-| Linux KVM backend | Available | x86_64, one active vCPU, virtio-mmio block/net, serial console. |
+| Linux KVM backend | Available | x86_64, 1-64 active vCPUs, virtio-mmio block/net, serial console. |
 | OCI image rootfs | Available | Pulls layers directly from registries, no Docker Engine required. |
 | Dockerfile rootfs | Available | Supports common JS app Dockerfiles and multi-stage `COPY --from`. |
 | Git repository builds | Available | `--repo`, `--ref`, and `--subdir` clone to temp storage before build. |
@@ -22,7 +22,7 @@ work in progress.
 | Real Linux RAM snapshot restore | Missing | Needs RAM + vCPU + irqchip/PIT + UART + virtio device state. |
 | Live guest exec channel | Missing | Needed for `pause -> exec -> pause` without rebooting the guest. |
 | Warm pool manager | Missing | Needs template cache, lease/recycle, health checks, and cleanup policy. |
-| Multi-vCPU runtime | Missing | `cpus` is accepted for manifests/options; native KVM run still uses one vCPU. |
+| Multi-vCPU runtime | Available | `--cpus` / `cpus` creates Linux/KVM vCPU threads and exposes them through ACPI/MP tables. |
 | Windows WHP runtime | In progress | Build/probe path exists; npm release should be treated as Linux/KVM today. |
 | Native prebuilts | Missing | Install currently builds with `node-gyp`; prebuilds are planned. |
 | Compose/multi-service apps | Missing | Single VM app/server workflow exists; stacks are not implemented yet. |

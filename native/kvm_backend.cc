@@ -56,6 +56,7 @@ constexpr uint64_t kIdtAddr = 0x520;
 constexpr uint32_t kMaxQueueSize = 256;
 constexpr uint32_t kKernelCmdlineMax = 2048;
 constexpr uint64_t kSnapshotPageSize = 4096;
+constexpr uint32_t kMaxVcpus = 64;
 constexpr int32_t kControlRun = 0;
 constexpr int32_t kControlPause = 1;
 constexpr int32_t kControlStop = 2;
@@ -627,10 +628,47 @@ struct Cpuid256 {
   struct kvm_cpuid_entry2 entries[256];
 };
 
-void SetupCpuid(KvmSystem& sys, Vcpu& vcpu) {
+uint32_t CeilLog2(uint32_t value) {
+  uint32_t out = 0;
+  uint32_t max = value > 0 ? value - 1 : 0;
+  while (max > 0) {
+    out++;
+    max >>= 1;
+  }
+  return out;
+}
+
+void SetupCpuid(KvmSystem& sys, Vcpu& vcpu, uint32_t cpu_id = 0, uint32_t cpu_count = 1) {
   Cpuid256 cpuid {};
   cpuid.nent = 256;
   CheckErr(IoctlPtr(sys.kvm.get(), KVM_GET_SUPPORTED_CPUID, &cpuid), "KVM_GET_SUPPORTED_CPUID");
+  uint32_t logical_cpus = std::min<uint32_t>(cpu_count, 255);
+  uint32_t topology_shift = CeilLog2(cpu_count);
+  for (uint32_t i = 0; i < cpuid.nent; i++) {
+    kvm_cpuid_entry2& entry = cpuid.entries[i];
+    if (entry.function == 1) {
+      entry.ebx = (entry.ebx & 0x00FFFFFFU) | ((cpu_id & 0xFFU) << 24);
+      entry.ebx = (entry.ebx & 0xFF00FFFFU) | (logical_cpus << 16);
+      if (cpu_count > 1) {
+        entry.edx |= (1U << 28);
+      }
+    } else if (entry.function == 0x0B || entry.function == 0x1F) {
+      entry.edx = cpu_id;
+      if (entry.index == 0) {
+        entry.eax = 0;
+        entry.ebx = 1;
+        entry.ecx = (1U << 8) | entry.index;
+      } else if (entry.index == 1) {
+        entry.eax = topology_shift;
+        entry.ebx = cpu_count;
+        entry.ecx = (2U << 8) | entry.index;
+      } else {
+        entry.eax = 0;
+        entry.ebx = 0;
+        entry.ecx = entry.index;
+      }
+    }
+  }
   CheckErr(IoctlPtr(vcpu.fd.get(), KVM_SET_CPUID2, &cpuid), "KVM_SET_CPUID2");
 }
 
@@ -680,6 +718,12 @@ void SetupLapic(Vcpu& vcpu) {
   lapic.regs[0x362] = 0x00;
   lapic.regs[0x363] = 0x00;
   CheckErr(IoctlPtr(vcpu.fd.get(), KVM_SET_LAPIC, &lapic), "KVM_SET_LAPIC");
+}
+
+void SetMpState(Vcpu& vcpu, int state) {
+  struct kvm_mp_state mp_state {};
+  mp_state.mp_state = state;
+  CheckErr(IoctlPtr(vcpu.fd.get(), KVM_SET_MP_STATE, &mp_state), "KVM_SET_MP_STATE");
 }
 
 void BuildPageTables(GuestMemory mem, uint64_t base) {
@@ -763,6 +807,23 @@ void SetupLongMode(Vcpu& vcpu, GuestMemory mem, uint64_t entry) {
   regs.rsp = 0x8FF0;
   regs.rbp = 0x8FF0;
   CheckErr(IoctlPtr(vcpu.fd.get(), KVM_SET_REGS, &regs), "KVM_SET_REGS");
+}
+
+void SetupBootstrapVcpu(KvmSystem& sys, Vcpu& vcpu, GuestMemory mem, uint64_t entry, uint32_t cpu_count) {
+  SetupCpuid(sys, vcpu, 0, cpu_count);
+  SetupMsrs(vcpu);
+  SetupFpu(vcpu);
+  SetupLongMode(vcpu, mem, entry);
+  SetupLapic(vcpu);
+}
+
+void SetupApplicationVcpu(KvmSystem& sys, Vcpu& vcpu, uint32_t cpu_id, uint32_t cpu_count) {
+  SetupCpuid(sys, vcpu, cpu_id, cpu_count);
+  SetupMsrs(vcpu);
+  SetupFpu(vcpu);
+  SetupRealMode(vcpu, 0);
+  SetupLapic(vcpu);
+  SetMpState(vcpu, KVM_MP_STATE_UNINITIALIZED);
 }
 
 struct KernelInfo {
@@ -1225,7 +1286,7 @@ std::vector<uint8_t> BuildRsdp(uint64_t rsdt_addr, uint64_t xsdt_addr) {
   return out;
 }
 
-uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled) {
+uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled, int cpus) {
   constexpr uint64_t rsdp_addr = 0x000E0000;
   uint64_t cursor = 0x000A0000;
   auto write_table = [&](const std::vector<uint8_t>& table) {
@@ -1239,7 +1300,7 @@ uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled) {
   auto dsdt = BuildDsdtTable(network_enabled);
   uint64_t dsdt_addr = write_table(dsdt);
   uint64_t fadt_addr = write_table(BuildFadt(dsdt_addr));
-  uint64_t madt_addr = write_table(BuildMadt(1));
+  uint64_t madt_addr = write_table(BuildMadt(cpus));
   uint64_t rsdt_addr = write_table(BuildRsdt({fadt_addr, madt_addr}));
   uint64_t xsdt_addr = write_table(BuildXsdt({fadt_addr, madt_addr}));
   auto rsdp = BuildRsdp(rsdt_addr, xsdt_addr);
@@ -2955,6 +3016,7 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
 	    std::string overlay_path = GetString(env, argv[0], "overlayPath");
 	    std::string cmdline = GetString(env, argv[0], "cmdline");
     uint32_t mem_mib = GetUint32(env, argv[0], "memMiB", 256);
+    uint32_t cpus = GetUint32(env, argv[0], "cpus", 1);
     uint32_t timeout_ms = GetUint32(env, argv[0], "timeoutMs", 60000);
     uint32_t console_limit = GetUint32(env, argv[0], "consoleLimit", 1024 * 1024);
     bool interactive = GetBool(env, argv[0], "interactive", false);
@@ -2966,16 +3028,17 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     Check(!kernel_path.empty(), "kernelPath is required");
     Check(!rootfs_path.empty(), "rootfsPath is required");
     Check(!cmdline.empty(), "cmdline is required");
+    Check(cpus >= 1 && cpus <= kMaxVcpus, "cpus must be between 1 and 64");
     Check(!network_enabled || !guest_mac.empty(), "netGuestMac is required when netTapName is set");
     Check(cmdline.size() + 1 <= kKernelCmdlineMax, "kernel cmdline is too long");
 
     KvmSystem sys = CreateVm(mem_mib, true);
     GuestMemory mem = sys.guest();
     KernelInfo kernel = LoadElfKernel(mem, kernel_path);
-    uint64_t rsdp_addr = CreateAcpiTables(mem, network_enabled);
+    uint64_t rsdp_addr = CreateAcpiTables(mem, network_enabled, static_cast<int>(cpus));
     WriteBootParams(mem, uint64_t(mem_mib) * 1024ULL * 1024ULL, cmdline);
     WriteU64(mem.ptr(kBootParamsAddr + 0x70, 8), rsdp_addr);
-    WriteMpTable(mem, 1);
+    WriteMpTable(mem, static_cast<int>(cpus));
     SetIrqRouting(sys);
 	    VirtioBlk blk(sys, mem, rootfs_path, overlay_path);
     std::unique_ptr<VirtioNet> net;
@@ -2983,16 +3046,20 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
       net = std::make_unique<VirtioNet>(sys, mem, tap_name, guest_mac);
     }
 
-    Vcpu vcpu = CreateVcpu(sys, 0);
-    SetupCpuid(sys, vcpu);
-    SetupMsrs(vcpu);
-    SetupFpu(vcpu);
-    SetupLongMode(vcpu, mem, kernel.entry);
-    SetupLapic(vcpu);
+    std::vector<Vcpu> vcpus;
+    vcpus.reserve(cpus);
+    for (uint32_t i = 0; i < cpus; i++) {
+      vcpus.push_back(CreateVcpu(sys, static_cast<int>(i)));
+    }
+    SetupBootstrapVcpu(sys, vcpus[0], mem, kernel.entry, cpus);
+    for (uint32_t i = 1; i < cpus; i++) {
+      SetupApplicationVcpu(sys, vcpus[i], i, cpus);
+    }
 
     Uart uart(console_limit, interactive, &sys);
     TerminalRawMode raw_mode(interactive);
     std::atomic<bool> input_done{false};
+    std::atomic<bool> host_interrupt_requested{false};
     std::thread input_thread;
     if (interactive) {
       input_thread = std::thread([&]() {
@@ -3025,6 +3092,17 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
             if (n == 0) {
               break;
             }
+            bool host_interrupt = false;
+            for (ssize_t i = 0; i < n; i++) {
+              if (buf[i] == 0x03) {
+                host_interrupt = true;
+                break;
+              }
+            }
+            if (host_interrupt) {
+              host_interrupt_requested = true;
+              break;
+            }
             uart.enqueue_rx(buf, static_cast<size_t>(n));
           }
         }
@@ -3038,42 +3116,92 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     };
 
     bool timeout_enabled = timeout_ms > 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto base_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     struct sigaction sa {};
     struct sigaction old_sa {};
     sa.sa_handler = [](int) {};
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, &old_sa);
+    std::mutex device_mu;
+    std::mutex result_mu;
+    std::mutex runner_mu;
+    std::string final_exit_reason = "host-stop";
+    std::string error_message;
+    uint32_t final_reason = KVM_EXIT_INTR;
+    std::vector<pthread_t> runner_threads(cpus);
+    std::vector<bool> runner_ready(cpus, false);
+    std::atomic<bool> vm_done{false};
     std::atomic<bool> watchdog_done{false};
     std::atomic<bool> watchdog_timeout{false};
     std::atomic<bool> watchdog_halted{false};
-    pthread_t runner_thread = pthread_self();
+    std::atomic<uint64_t> runs{0};
+    std::atomic<uint32_t> paused_count{0};
+    std::atomic<int64_t> timeout_extension_ms{0};
+    auto set_runner_thread = [&](uint32_t cpu_index) {
+      std::lock_guard<std::mutex> lock(runner_mu);
+      runner_threads[cpu_index] = pthread_self();
+      runner_ready[cpu_index] = true;
+    };
+    auto interrupt_all = [&]() {
+      for (auto& cpu : vcpus) {
+        cpu.run->immediate_exit = 1;
+      }
+      std::lock_guard<std::mutex> lock(runner_mu);
+      for (uint32_t i = 0; i < cpus; i++) {
+        if (runner_ready[i]) {
+          pthread_kill(runner_threads[i], SIGUSR1);
+        }
+      }
+    };
+    auto finish = [&](const std::string& reason, uint32_t code) {
+      bool expected = false;
+      if (vm_done.compare_exchange_strong(expected, true)) {
+        {
+          std::lock_guard<std::mutex> lock(result_mu);
+          final_exit_reason = reason;
+          final_reason = code;
+        }
+        interrupt_all();
+      }
+    };
+    auto record_error = [&](const std::string& message) {
+      {
+        std::lock_guard<std::mutex> lock(result_mu);
+        if (error_message.empty()) {
+          error_message = message;
+        }
+      }
+      finish("host-error", KVM_EXIT_INTERNAL_ERROR);
+    };
     std::thread watchdog([&]() {
       while (!watchdog_done.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        if (control.command() != kControlRun) {
-          vcpu.run->immediate_exit = 1;
-          pthread_kill(runner_thread, SIGUSR1);
+        if (host_interrupt_requested.load()) {
+          finish("host-stop", KVM_EXIT_INTR);
+          break;
         }
-	        if (net && net->tap_readable()) {
-	          vcpu.run->immediate_exit = 1;
-	          pthread_kill(runner_thread, SIGUSR1);
-	        }
+        if (control.command() != kControlRun) {
+          interrupt_all();
+        }
+        if (net && net->tap_readable()) {
+          interrupt_all();
+        }
         if (control.command() == kControlPause) {
           continue;
         }
+        auto deadline = base_deadline + std::chrono::milliseconds(timeout_extension_ms.load());
         if (timeout_enabled && std::chrono::steady_clock::now() > deadline) {
           watchdog_timeout = true;
           break;
         }
         if (uart.contains("reboot: System halted") || uart.contains("Restarting system")) {
           watchdog_halted = true;
+          finish("halted-console", KVM_EXIT_HLT);
           break;
         }
       }
       if (!watchdog_done.load()) {
-        vcpu.run->immediate_exit = 1;
-        pthread_kill(runner_thread, SIGUSR1);
+        interrupt_all();
       }
     });
     auto stop_watchdog = [&]() {
@@ -3083,55 +3211,81 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
       }
       sigaction(SIGUSR1, &old_sa, nullptr);
     };
-    auto make_result = [&](const std::string& reason, uint32_t code, uint32_t runs_value) {
+    auto make_result = [&]() {
       control.set_state(kControlStateExited);
       stop_input();
       stop_watchdog();
+      if (!error_message.empty()) {
+        throw std::runtime_error(error_message);
+      }
+      std::string reason;
+      uint32_t code = 0;
+      {
+        std::lock_guard<std::mutex> lock(result_mu);
+        reason = final_exit_reason;
+        code = final_reason;
+      }
+      uint64_t total_runs = runs.load();
       napi_value out = MakeObject(env);
       SetString(env, out, "exitReason", reason);
       SetUint32(env, out, "exitReasonCode", code);
-      SetUint32(env, out, "runs", runs_value);
+      SetUint32(env, out, "runs", total_runs > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(total_runs));
       SetString(env, out, "console", uart.console());
       return out;
     };
 
-    GuestExit guest_exit;
-    uint32_t runs = 0;
-    uint32_t final_reason = 0;
-    try {
-      control.set_state(kControlStateRunning);
+    auto vcpu_loop = [&](uint32_t cpu_index) {
+      Vcpu& cpu = vcpus[cpu_index];
+      set_runner_thread(cpu_index);
       for (;;) {
+        if (vm_done.load()) {
+          return;
+        }
         int32_t command = control.command();
         if (command == kControlStop) {
           control.set_state(kControlStateStopping);
-          return make_result("host-stop", KVM_EXIT_INTR, runs);
+          finish("host-stop", KVM_EXIT_INTR);
+          return;
         }
         if (command == kControlPause) {
           auto paused_at = std::chrono::steady_clock::now();
-          control.set_state(kControlStatePaused);
-          while (control.command() == kControlPause) {
+          if (paused_count.fetch_add(1) + 1 == cpus) {
+            control.set_state(kControlStatePaused);
+          }
+          while (control.command() == kControlPause && !vm_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
-          if (timeout_enabled) {
-            deadline += std::chrono::steady_clock::now() - paused_at;
+          paused_count.fetch_sub(1);
+          if (timeout_enabled && cpu_index == 0) {
+            auto paused_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - paused_at)
+                                 .count();
+            timeout_extension_ms.fetch_add(paused_ms);
           }
           if (control.command() == kControlStop) {
             control.set_state(kControlStateStopping);
-            return make_result("host-stop", KVM_EXIT_INTR, runs);
+            finish("host-stop", KVM_EXIT_INTR);
+            return;
           }
-          control.set_state(kControlStateRunning);
+          if (!vm_done.load()) {
+            control.set_state(kControlStateRunning);
+          }
         }
-        if (net) {
+        if (cpu_index == 0 && net) {
+          std::lock_guard<std::mutex> lock(device_mu);
           net->poll_rx();
         }
-        int rc = ioctl(vcpu.fd.get(), KVM_RUN, 0);
+        cpu.run->immediate_exit = 0;
+        int rc = ioctl(cpu.fd.get(), KVM_RUN, 0);
         if (rc < 0 && (errno == EINTR || errno == EAGAIN)) {
-          vcpu.run->immediate_exit = 0;
-          if (net) {
+          cpu.run->immediate_exit = 0;
+          if (cpu_index == 0 && net) {
+            std::lock_guard<std::mutex> lock(device_mu);
             net->poll_rx();
           }
           if (watchdog_halted.load()) {
-            return make_result("halted-console", KVM_EXIT_HLT, runs);
+            finish("halted-console", KVM_EXIT_HLT);
+            return;
           }
           if (watchdog_timeout.load()) {
             throw std::runtime_error("VM timed out after " + std::to_string(timeout_ms) + "ms");
@@ -3139,37 +3293,91 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
           continue;
         }
         CheckErr(rc, "KVM_RUN");
-        runs++;
-        final_reason = vcpu.run->exit_reason;
-        switch (vcpu.run->exit_reason) {
-          case KVM_EXIT_IO:
-            HandleIo(vcpu.run, uart, &guest_exit);
+        runs.fetch_add(1);
+        uint32_t exit_reason = cpu.run->exit_reason;
+        switch (cpu.run->exit_reason) {
+          case KVM_EXIT_IO: {
+            GuestExit guest_exit;
+            {
+              std::lock_guard<std::mutex> lock(device_mu);
+              HandleIo(cpu.run, uart, &guest_exit);
+            }
             if (guest_exit.requested) {
-              return make_result("guest-exit", final_reason, runs);
+              finish("guest-exit", exit_reason);
+              return;
             }
             if (uart.contains("reboot: System halted") || uart.contains("Restarting system")) {
-              return make_result("halted-console", KVM_EXIT_HLT, runs);
+              finish("halted-console", KVM_EXIT_HLT);
+              return;
             }
             break;
+          }
           case KVM_EXIT_MMIO:
-            HandleMmio(vcpu.run, blk, net.get());
+            {
+              std::lock_guard<std::mutex> lock(device_mu);
+              HandleMmio(cpu.run, blk, net.get());
+            }
             break;
           case KVM_EXIT_IRQ_WINDOW_OPEN:
-            vcpu.run->request_interrupt_window = 0;
+            cpu.run->request_interrupt_window = 0;
             break;
           case KVM_EXIT_HLT:
+            if (cpu_index == 0) {
+              finish(ExitReasonName(exit_reason), exit_reason);
+              return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            break;
           case KVM_EXIT_SHUTDOWN:
           case KVM_EXIT_SYSTEM_EVENT:
-            return make_result(ExitReasonName(final_reason), final_reason, runs);
+            finish(ExitReasonName(exit_reason), exit_reason);
+            return;
           case KVM_EXIT_INTERNAL_ERROR:
             throw std::runtime_error("KVM internal error");
           case KVM_EXIT_FAIL_ENTRY:
-            throw std::runtime_error("KVM fail entry hardware_entry_failure_reason=" + std::to_string(vcpu.run->fail_entry.hardware_entry_failure_reason));
+            throw std::runtime_error("KVM fail entry hardware_entry_failure_reason=" + std::to_string(cpu.run->fail_entry.hardware_entry_failure_reason));
           default:
-            throw std::runtime_error("unhandled KVM exit: " + ExitReasonName(final_reason));
+            throw std::runtime_error("unhandled KVM exit: " + ExitReasonName(exit_reason));
         }
       }
+    };
+
+    std::vector<std::thread> ap_threads;
+    ap_threads.reserve(cpus > 0 ? cpus - 1 : 0);
+    try {
+      control.set_state(kControlStateRunning);
+      for (uint32_t i = 1; i < cpus; i++) {
+        ap_threads.emplace_back([&, i]() {
+          try {
+            vcpu_loop(i);
+          } catch (const std::exception& err) {
+            record_error(err.what());
+          } catch (...) {
+            record_error("unknown vCPU runner error");
+          }
+        });
+      }
+      try {
+        vcpu_loop(0);
+      } catch (const std::exception& err) {
+        record_error(err.what());
+      } catch (...) {
+        record_error("unknown vCPU runner error");
+      }
+      finish("host-stop", KVM_EXIT_INTR);
+      for (auto& thread : ap_threads) {
+        if (thread.joinable()) {
+          thread.join();
+        }
+      }
+      return make_result();
     } catch (...) {
+      finish("host-error", KVM_EXIT_INTERNAL_ERROR);
+      for (auto& thread : ap_threads) {
+        if (thread.joinable()) {
+          thread.join();
+        }
+      }
       stop_input();
       stop_watchdog();
       throw;

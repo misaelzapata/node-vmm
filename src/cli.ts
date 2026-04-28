@@ -96,7 +96,7 @@ Common flags:
   --code STRING         source code for the code command
   --js STRING           JavaScript source alias for --code
   --language NAME       javascript|typescript|shell for the code command
-  --interactive         connect a terminal TTY to the guest serial console
+  --interactive         connect a terminal TTY; Ctrl-C stops the VM
   --sandbox             restore-fast mode: write guest disk changes to a temp overlay
   --restore             alias for --sandbox
   --overlay PATH        explicit sparse overlay path for --sandbox
@@ -109,7 +109,7 @@ Common flags:
   --cache-dir DIR       OCI blob cache (default: /tmp/node-vmm/oci-cache)
   --arch ARCH           OCI architecture (default: host arch)
   --mem MIB             guest memory (default: 256)
-  --cpus N              vCPU count; v0.1 runtime accepts 1 (default: 1)
+  --cpus N              vCPU count, 1-64 (default: 1)
   --net auto|none|tap   network mode (default: auto)
   --tap NAME            existing/created TAP name for --net tap or auto
   -p, --publish SPEC    Docker-style TCP publish: [IP:]HOST:CONTAINER[/tcp]

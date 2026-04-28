@@ -161,7 +161,7 @@ Linux runtime:
 | Run a prepared rootfs with `--net none` | Yes | Yes | No, if user can open `/dev/kvm` |
 | Run web apps with `--net auto -p 3000:3000` | Yes | Yes | Yes |
 | Next.js, Vite React/Vue, Express, Fastify app servers | Yes | Yes | Yes |
-| Multi-vCPU runtime with `--cpus > 1` | Not yet | Yes | Depends on network/rootfs setup |
+| Multi-vCPU runtime with `--cpus > 1` | Yes, Linux/KVM | Yes | Depends on network/rootfs setup |
 | Windows WHP runtime | In progress | Host WHP | No Linux sudo |
 
 Windows work in progress:
@@ -249,6 +249,10 @@ sudo node-vmm run \
   --image alpine:3.20 \
   --cmd /bin/sh \
   --interactive
+
+In an interactive console, `exit` or `Ctrl-D` exits the guest shell normally.
+`Ctrl-C` is reserved as a host escape: it stops the VM, restores the terminal,
+and runs the usual network/overlay cleanup.
 
 sudo node-vmm run \
   --rootfs ./alpine.ext4 \
@@ -403,7 +407,7 @@ For full API notes, Next.js usage, testing, and publishing, see:
 
 ## Current v1 Support
 
-- x86_64 KVM on Linux, one active vCPU
+- x86_64 KVM on Linux, 1-64 active vCPUs
 - experimental WHP backend work for Windows
 - ELF `vmlinux` kernels
 - UART console with batch and interactive modes
@@ -414,10 +418,9 @@ For full API notes, Next.js usage, testing, and publishing, see:
 - OCI manifest/index resolution, gzip layers, cache, and basic whiteouts
 - Dockerfile builds for common Node/JS app patterns without Docker Engine
 
-`--cpus` / `cpus` is wired through the CLI, SDK, and snapshot manifests, but the
-native Linux runtime rejects values above `1` until the multi-vCPU loop is
-complete.
+`--cpus` / `cpus` is wired through the CLI, SDK, native KVM runtime, ACPI/MP
+tables, and snapshot manifests. Values must be integers from `1` to `64`.
 
 Next release work: full WHP boot parity, broader Dockerfile instruction
-coverage, migration, jailer, multi-vCPU execution, bzImage boot, and the
-long-lived in-guest exec agent.
+coverage, migration, jailer, bzImage boot, and the long-lived in-guest exec
+agent.

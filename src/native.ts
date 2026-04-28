@@ -95,6 +95,7 @@ export interface KvmRunConfig {
   rootfsPath: string;
   overlayPath?: string;
   memMiB: number;
+  cpus?: number;
   cmdline: string;
   timeoutMs?: number;
   consoleLimit?: number;

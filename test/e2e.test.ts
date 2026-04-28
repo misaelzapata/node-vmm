@@ -19,13 +19,24 @@ function runHost(command: string, args: string[], message: string): void {
   }
 }
 
-async function buildLocalBusyboxRootfs(tempDir: string): Promise<string> {
+async function removeTempTree(target: string): Promise<void> {
+  try {
+    await rm(target, { recursive: true, force: true });
+  } catch (error) {
+    const result = spawnSync("sudo", ["-n", "rm", "-rf", target], { encoding: "utf8" });
+    if (result.status !== 0) {
+      throw error;
+    }
+  }
+}
+
+async function buildLocalBusyboxRootfs(tempDir: string, mode: "batch" | "interactive" = "interactive"): Promise<string> {
   assert.equal(existsSync(BUSYBOX), true, `busybox not found: ${BUSYBOX}`);
   const rootfs = path.join(tempDir, "e2e.ext4");
   const mountDir = path.join(tempDir, "mnt");
   const initPath = path.join(tempDir, "init");
   const consoleHelper = path.join(tempDir, "node-vmm-console");
-  await writeFile(initPath, renderInitScript({ commandLine: "/bin/sh", workdir: "/", mode: "interactive" }));
+  await writeFile(initPath, renderInitScript({ commandLine: "/bin/sh", workdir: "/", mode }));
   runHost("g++", ["-static", "-Os", "-s", "-o", consoleHelper, path.join(process.cwd(), "guest", "node-vmm-console.cc"), "-lutil"], "failed to build console helper");
 
   runHost("truncate", ["-s", "64M", rootfs], "failed to allocate e2e rootfs");
@@ -61,7 +72,7 @@ async function buildLocalBusyboxRootfs(tempDir: string): Promise<string> {
       ["-n", "install", "-m", "0755", "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", path.join(mountDir, "lib64", "ld-linux-x86-64.so.2")],
       "failed to install dynamic loader",
     );
-    for (const applet of ["sh", "mount", "mkdir", "rm", "mknod", "chmod", "ln", "cat", "tail", "sync", "dd", "wc"]) {
+    for (const applet of ["sh", "mount", "mkdir", "rm", "mknod", "chmod", "ln", "cat", "tail", "sync", "dd", "wc", "nproc"]) {
       runHost("sudo", ["-n", "ln", "-sf", "busybox", path.join(mountDir, "bin", applet)], `failed to link ${applet}`);
     }
     for (const applet of ["poweroff", "reboot"]) {
@@ -88,6 +99,8 @@ import sys
 import time
 
 cmd = sys.argv[1:]
+send_input = os.environ.get("NODE_VMM_E2E_PTY_INPUT", "echo e2e-console-ok\nexit\n").encode()
+expect = os.environ.get("NODE_VMM_E2E_PTY_EXPECT", "e2e-console-ok").encode()
 master, slave = pty.openpty()
 proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
 os.close(slave)
@@ -110,9 +123,9 @@ try:
             os.write(1, data)
             buf += data
             if not sent and (b"~ # " in buf or b"/ # " in buf or b"# " in buf):
-                os.write(master, b"echo e2e-console-ok\nexit\n")
+                os.write(master, send_input)
                 sent = True
-            if b"e2e-console-ok" in buf and b" stopped:" in buf:
+            if expect in buf and b" stopped:" in buf:
                 ok = True
                 break
         if proc.poll() is not None:
@@ -141,6 +154,7 @@ sys.exit(0 if ok and proc.returncode == 0 else 1)
   return new Promise((resolve, reject) => {
     const child = spawn("python3", ["-c", script, ...command], {
       cwd: process.cwd(),
+      env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
@@ -168,22 +182,28 @@ test("e2e interactive shell accepts input and exits", { skip: !E2E_ENABLED }, as
   assert.equal(existsSync(kernel), true, `kernel not found: ${kernel}`);
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-e2e-"));
   try {
-    const rootfs = process.env.NODE_VMM_E2E_ROOTFS || (await buildLocalBusyboxRootfs(tempDir));
+    const sourceArgs = process.env.NODE_VMM_E2E_ROOTFS
+      ? ["--rootfs", process.env.NODE_VMM_E2E_ROOTFS]
+      : ["--image", "alpine:3.20", "--disk", "256", "--cache-dir", path.join(tempDir, "oci-cache")];
     const result = await runPythonPty(
       [
         "sudo",
         "-n",
+        "env",
+        `NODE_VMM_KERNEL=${kernel}`,
+        `PATH=${process.env.PATH || ""}`,
         "node",
         "dist/src/main.js",
         "run",
-        "--rootfs",
-        rootfs,
+        ...sourceArgs,
         "--kernel",
         kernel,
         "--cmd",
         "/bin/sh",
         "--mem",
         "256",
+        "--net",
+        "none",
         "--timeout-ms",
         "60000",
       ],
@@ -195,6 +215,105 @@ test("e2e interactive shell accepts input and exits", { skip: !E2E_ENABLED }, as
     assert.match(result.output, /e2e-console-ok/);
     assert.match(result.output, /stopped:/);
   } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    await removeTempTree(tempDir);
+  }
+});
+
+test("e2e interactive Ctrl-C stops the VM from the host", { skip: !E2E_ENABLED }, async () => {
+  const kernel = await requireKernelPath();
+  assert.equal(existsSync(kernel), true, `kernel not found: ${kernel}`);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-e2e-ctrlc-"));
+  const oldInput = process.env.NODE_VMM_E2E_PTY_INPUT;
+  const oldExpect = process.env.NODE_VMM_E2E_PTY_EXPECT;
+  try {
+    process.env.NODE_VMM_E2E_PTY_INPUT = "\x03";
+    process.env.NODE_VMM_E2E_PTY_EXPECT = "host-stop";
+    const sourceArgs = process.env.NODE_VMM_E2E_ROOTFS
+      ? ["--rootfs", process.env.NODE_VMM_E2E_ROOTFS]
+      : ["--image", "alpine:3.20", "--disk", "256", "--cache-dir", path.join(tempDir, "oci-cache")];
+    const result = await runPythonPty(
+      [
+        "sudo",
+        "-n",
+        "env",
+        `NODE_VMM_KERNEL=${kernel}`,
+        `PATH=${process.env.PATH || ""}`,
+        "node",
+        "dist/src/main.js",
+        "run",
+        ...sourceArgs,
+        "--kernel",
+        kernel,
+        "--cmd",
+        "/bin/sh",
+        "--interactive",
+        "--mem",
+        "256",
+        "--net",
+        "none",
+        "--timeout-ms",
+        "60000",
+      ],
+      150_000,
+    );
+
+    assert.equal(result.code, 0, result.output);
+    assert.match(result.output, /host-stop/);
+  } finally {
+    if (oldInput === undefined) {
+      delete process.env.NODE_VMM_E2E_PTY_INPUT;
+    } else {
+      process.env.NODE_VMM_E2E_PTY_INPUT = oldInput;
+    }
+    if (oldExpect === undefined) {
+      delete process.env.NODE_VMM_E2E_PTY_EXPECT;
+    } else {
+      process.env.NODE_VMM_E2E_PTY_EXPECT = oldExpect;
+    }
+    await removeTempTree(tempDir);
+  }
+});
+
+test("e2e exposes requested vCPUs to Linux guests", { skip: !E2E_ENABLED }, async () => {
+  const kernel = await requireKernelPath();
+  assert.equal(existsSync(kernel), true, `kernel not found: ${kernel}`);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-e2e-vcpus-"));
+  try {
+    const sourceArgs = process.env.NODE_VMM_E2E_ROOTFS
+      ? ["--rootfs", process.env.NODE_VMM_E2E_ROOTFS]
+      : ["--image", "alpine:3.20", "--disk", "256", "--cache-dir", path.join(tempDir, "oci-cache")];
+    const result = spawnSync(
+      "sudo",
+      [
+        "-n",
+        "env",
+        `NODE_VMM_KERNEL=${kernel}`,
+        `PATH=${process.env.PATH || ""}`,
+        "node",
+        "dist/src/main.js",
+        "run",
+        ...sourceArgs,
+        "--kernel",
+        kernel,
+        "--cmd",
+        "nproc",
+        "--cpus",
+        "2",
+        "--mem",
+        "512",
+        "--net",
+        "none",
+        "--fast-exit",
+        "--timeout-ms",
+        "60000",
+      ],
+      { encoding: "utf8" },
+    );
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.equal(result.status, 0, output);
+    assert.match(output, /(^|\n)2(\r?\n)/);
+    assert.match(output, /stopped:/);
+  } finally {
+    await removeTempTree(tempDir);
   }
 });

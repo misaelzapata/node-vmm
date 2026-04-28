@@ -73,7 +73,7 @@ function featureLines(): string[] {
   `backend: ${backend === "unsupported" ? "none" : backend}`,
   `arch: ${backend === "whp" ? "windows/x86_64" : "linux/x86_64"}`,
   "kernel: ELF vmlinux",
-  "vcpu: 1 active today; cpus is recorded in snapshot manifests for the multi-vCPU native cut",
+  "vcpu: 1-64 on Linux/KVM; default 1",
   "memory: configurable with --mem",
   "disk: virtio-mmio block at /dev/vda",
   "restore: core snapshots restore with a sparse copy-on-write disk overlay",
@@ -82,7 +82,7 @@ function featureLines(): string[] {
   "network: virtio-mmio net with TAP/NAT via --net auto",
   "snapshot: native RAM and dirty-page primitives are exposed for backend release gates",
   backend === "whp" ? "windows: WHP probe and native smoke are available in the Windows addon" : "windows: WHP backend builds on Windows",
-  "unsupported: bzImage, jailer, multi-vCPU execution",
+  "unsupported: bzImage, jailer",
   ];
 }
 
@@ -126,7 +126,11 @@ function memoryFromOptions(options: { memory?: number; memMiB?: number }): numbe
 }
 
 function cpusFromOptions(options: { cpus?: number }): number {
-  return options.cpus ?? 1;
+  const cpus = options.cpus ?? 1;
+  if (!Number.isInteger(cpus) || cpus < 1 || cpus > 64) {
+    throw new NodeVmmError("cpus must be an integer between 1 and 64");
+  }
+  return cpus;
 }
 
 function restoreEnabled(options: { restore?: boolean; sandbox?: boolean; overlayPath?: string }): boolean {
@@ -144,9 +148,7 @@ function validateVmOptions(options: { cpus?: number; net?: NetworkMode; network?
   if (!["auto", "none", "tap"].includes(network)) {
     throw new NodeVmmError("net must be auto, none, or tap");
   }
-  if ((options.cpus ?? 1) !== 1) {
-    throw new NodeVmmError("the KVM backend v1 supports exactly one vCPU; run `node-vmm features` for the current matrix");
-  }
+  cpusFromOptions(options);
 }
 
 async function cleanupBestEffort(steps: Array<(() => Promise<void>) | undefined>): Promise<void> {
@@ -593,6 +595,7 @@ export async function runImage(
         rootfsPath,
         overlayPath,
         memMiB: memoryFromOptions(options),
+        cpus: cpusFromOptions(options),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,
@@ -721,6 +724,7 @@ export async function startVm(
         rootfsPath,
         overlayPath,
         memMiB: memoryFromOptions(options),
+        cpus: cpusFromOptions(options),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,
@@ -843,6 +847,7 @@ export async function bootRootfs(
         rootfsPath: resolvedRootfs,
         overlayPath,
         memMiB: memoryFromOptions(options),
+        cpus: cpusFromOptions(options),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,

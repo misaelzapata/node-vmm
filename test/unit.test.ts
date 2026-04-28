@@ -623,6 +623,7 @@ test("SDK exposes feature, doctor, and client helpers", async () => {
   const nodeClient: NodeVmmClient = createNodeVmmClient({ logger: () => undefined });
   assert.deepEqual(client.features(), features());
   assert.deepEqual(nodeClient.features(), features());
+  assert.ok(features().some((line) => line.includes("vcpu: 1-64")));
   assert.equal(typeof client.run, "function");
   assert.equal(typeof client.runCode, "function");
   assert.equal(typeof client.boot, "function");
@@ -641,18 +642,16 @@ test("SDK validates missing options before doing expensive work", async () => {
     /rootfsPath\/diskPath aliases disagree/,
   );
   await assert.rejects(
-    () => bootRootfs({ kernelPath: "vmlinux", diskPath: "disk.ext4", cpus: 2, network: "none" }),
-    /one vCPU/,
+    () => bootRootfs({ kernelPath: "vmlinux", diskPath: "disk.ext4", cpus: 0, network: "none" }),
+    /cpus must be an integer between 1 and 64/,
   );
   await assert.rejects(
-    () => runImage({ kernelPath: "vmlinux", rootfsPath: "disk.ext4", cpus: 2, network: "none" }),
-    /one vCPU|requires root/,
+    () => bootRootfs({ kernelPath: "vmlinux", diskPath: "disk.ext4", cpus: 1.5, network: "none" }),
+    /cpus must be an integer between 1 and 64/,
   );
-  await assert.rejects(() => boot({ kernel: "vmlinux", disk: "disk.ext4", cpus: 2, net: "none" }), /one vCPU/);
-  await assert.rejects(() => run({ kernel: "vmlinux", rootfsPath: "disk.ext4", cpus: 2, net: "none" }), /one vCPU|requires root/);
   await assert.rejects(
-    () => runCode({ kernel: "vmlinux", rootfsPath: "disk.ext4", code: "console.log(1)", cpus: 2, net: "none" }),
-    /one vCPU|requires root/,
+    () => boot({ kernel: "vmlinux", disk: "disk.ext4", cpus: 65, net: "none" }),
+    /cpus must be an integer between 1 and 64/,
   );
   const oldNodeKernel = process.env.NODE_VMM_KERNEL;
   const oldKernelCache = process.env.NODE_VMM_KERNEL_CACHE_DIR;
@@ -719,8 +718,8 @@ test("core snapshot create writes a reusable bundle manifest", async () => {
   assert.equal(manifest.kernel, "kernel");
 
   await assert.rejects(
-    () => restoreSnapshot({ snapshot: output, cpus: 2, net: "none" }),
-    /one vCPU|requires root/,
+    () => restoreSnapshot({ snapshot: output, cpus: 0, net: "none" }),
+    /cpus must be an integer between 1 and 64/,
   );
   await rm(dir, { recursive: true, force: true });
 });

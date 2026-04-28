@@ -46,8 +46,9 @@ branches visible instead of silently ignoring them.
 export NODE_VMM_KERNEL="$(npm run -s kernel:fetch)"
 ```
 
-The e2e test builds a disposable local BusyBox rootfs, opens an interactive
-shell, sends input through a PTY, and verifies the VM exits cleanly. Set
+The e2e test builds disposable Alpine rootfs images, opens an interactive shell,
+sends input through a PTY, checks that `Ctrl-C` is a host stop escape, and
+verifies that `--cpus 2` is visible inside Linux with `nproc`. Set
 `NODE_VMM_E2E_ROOTFS=/path/to/rootfs.ext4` to reuse a prepared disk instead.
 
 ## Rootless Smoke

@@ -310,6 +310,11 @@ await kvm.boot({
 });
 ```
 
+All VM entry points accept `cpus` from `1` to `64` on Linux/KVM. The native
+backend creates one host thread per vCPU and advertises the topology through
+ACPI/MP tables, so a Linux guest sees the requested count with tools like
+`nproc`.
+
 ### `kvm.createSnapshot(options)`
 
 Creates a core snapshot bundle with `rootfs.ext4`, `kernel`, and
