@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux build, unit, pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run test:unit
+      - run: npm run pack:check
+
+  windows:
+    name: windows build, import, WHP probe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - shell: pwsh
+        run: |
+          node -e "import('./dist/src/index.js').then((m)=>{ if (!m.features().some((line)=>line.includes('whp'))) process.exit(1); console.log(m.features()[0]); })"
+          node -e "import('./dist/src/kvm.js').then((m)=>{ const probe = m.probeWhp(); if (probe.backend !== 'whp') process.exit(1); console.log(JSON.stringify(probe)); })"
+      - run: npm pack --dry-run --ignore-scripts
+
+  windows-whp-gate:
+    name: windows WHP native gate
+    runs-on: [self-hosted, windows, x64, whp]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - shell: pwsh
+        run: |
+          node -e "import('./dist/src/index.js').then(async (m)=>{ const doctor = await m.doctor(); console.log(JSON.stringify(doctor, null, 2)); if (!doctor.ok) process.exit(1); })"
+          node -e "import('./dist/src/kvm.js').then((m)=>{ const smoke = m.whpSmokeHlt(); console.log(JSON.stringify(smoke, null, 2)); if (smoke.exitReason !== 'hlt' || smoke.dirtyPages < 1) process.exit(1); })"
+
+  kvm-release-gate:
+    name: kvm release gate
+    runs-on: [self-hosted, linux, x64, kvm]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run release:check

@@ -1,0 +1,131 @@
+{
+  "name": "node-vmm",
+  "version": "0.1.0",
+  "description": "A TypeScript/JavaScript SDK and CLI for running small hypervisor-backed microVMs from OCI images.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.npmjs.com/package/node-vmm",
+  "bugs": {
+    "url": "https://github.com/misaelzapata/node-vmm/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/misaelzapata/node-vmm.git"
+  },
+  "keywords": [
+    "kvm",
+    "whp",
+    "windows-hypervisor-platform",
+    "microvm",
+    "virtualization",
+    "oci",
+    "typescript",
+    "nodejs"
+  ],
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./args": {
+      "types": "./dist/src/args.d.ts",
+      "import": "./dist/src/args.js"
+    },
+    "./kvm": {
+      "types": "./dist/src/kvm.d.ts",
+      "import": "./dist/src/kvm.js"
+    },
+    "./kernel": {
+      "types": "./dist/src/kernel.d.ts",
+      "import": "./dist/src/kernel.js"
+    },
+    "./native": {
+      "types": "./dist/src/native.d.ts",
+      "import": "./dist/src/native.js"
+    },
+    "./net": {
+      "types": "./dist/src/net.d.ts",
+      "import": "./dist/src/net.js"
+    },
+    "./oci": {
+      "types": "./dist/src/oci.d.ts",
+      "import": "./dist/src/oci.js"
+    },
+    "./process": {
+      "types": "./dist/src/process.d.ts",
+      "import": "./dist/src/process.js"
+    },
+    "./rootfs": {
+      "types": "./dist/src/rootfs.d.ts",
+      "import": "./dist/src/rootfs.js"
+    },
+    "./types": {
+      "types": "./dist/src/types.d.ts",
+      "import": "./dist/src/types.js"
+    },
+    "./utils": {
+      "types": "./dist/src/utils.d.ts",
+      "import": "./dist/src/utils.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "node-vmm": "dist/src/main.js"
+  },
+  "files": [
+    "dist/src",
+    "native",
+    "guest",
+    "docs",
+    "vhs/launch.tape",
+    "vhs/launch.expect",
+    "vhs/console-demo.py",
+    "scripts/build-native.mjs",
+    "binding.gyp",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run build:native && npm run build:ts",
+    "build:ts": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
+    "build:native": "node scripts/build-native.mjs --required",
+    "build:native:coverage": "CXXFLAGS='--coverage -O0' LDFLAGS='--coverage' node-gyp rebuild",
+    "install": "node scripts/build-native.mjs",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:unit": "npm run build && node --test dist/test/unit.test.js",
+    "test:coverage": "npm run test:coverage:ts && npm run test:coverage:cpp",
+    "test:coverage:ts": "npm run build && c8 --100 --all --include 'dist/src/args.js' --include 'dist/src/kernel.js' --include 'dist/src/kvm.js' --include 'dist/src/process.js' --include 'dist/src/types.js' --include 'dist/src/utils.js' --reporter=text --reporter=json-summary node --test dist/test/*.test.js",
+    "test:coverage:cpp": "npm run build:native:coverage && node --test dist/test/native.test.js && node scripts/check-gcov.mjs",
+    "test:e2e": "npm run build && NODE_VMM_E2E=1 node --test dist/test/e2e.test.js",
+    "test:consumers": "npm run build && node scripts/consumer-smoke.mjs",
+    "test:js-apps": "npm run build && node scripts/js-app-smoke.mjs",
+    "test:real-apps": "node scripts/real-app-smoke.mjs",
+    "bench:boot-run": "npm run build && node bench/boot-run.mjs",
+    "bench:restore": "npm run build && node bench/restore.mjs",
+    "bench:hot-sandbox": "npm run build && node bench/hot-sandbox.mjs",
+    "bench:node-code": "npm run build && node bench/node-code.mjs",
+    "kernel:fetch": "node scripts/fetch-kernel.mjs",
+    "clean": "node scripts/clean.mjs",
+    "demo:vhs": "vhs vhs/launch.tape",
+    "release:check": "node scripts/release-check.mjs",
+    "pack:check": "npm run build && node scripts/pack-check.mjs",
+    "doctor": "npm run build && node dist/src/main.js doctor",
+    "start": "npm run build && node dist/src/main.js"
+  },
+  "engines": {
+    "node": ">=18.19"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "c8": "^11.0.0",
+    "node-gyp": "^12.3.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "dockerfile-ast": "^0.7.1",
+    "tar": "^7.5.13"
+  }
+}

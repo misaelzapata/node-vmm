@@ -1,0 +1,14 @@
+dist/
+node_modules/
+build/
+coverage/
+.nyc_output/
+*.log
+*.ext4
+*.gcov
+*.gcda
+*.gcno
+__pycache__/
+node-vmm-*.tgz
+.node-vmm/
+.codex
