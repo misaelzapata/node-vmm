@@ -1,12 +1,61 @@
 # node-vmm
 
-`node-vmm` is a TypeScript/JavaScript SDK and CLI for booting small Linux
-microVMs from Node. It pulls OCI images directly from registries, assembles ext4
-rootfs images, and runs them through a small N-API KVM backend on Linux.
+[![CI](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
+[![npm downloads](https://img.shields.io/npm/dm/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
+[![Node.js](https://img.shields.io/node/v/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
+[![Types](https://img.shields.io/badge/types-TypeScript-blue.svg?style=flat)](docs/sdk.md)
+[![ESM only](https://img.shields.io/badge/module-ESM%20only-4b32c3.svg?style=flat)](docs/sdk.md)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg?style=flat)](docs/testing.md)
+[![Runtime](https://img.shields.io/badge/runtime-Linux%2FKVM-2ea44f.svg?style=flat)](#requirements)
+[![Windows](https://img.shields.io/badge/Windows%20WHP-in%20progress-orange.svg?style=flat)](docs/windows.md)
 
-Windows Hypervisor Platform support is in progress. The package is structured
-so Windows can import the SDK and build the experimental WHP addon, but the npm
-release target today is the Linux/KVM runtime.
+**Run real Node apps inside small Linux microVMs from TypeScript or JavaScript.**
+
+`node-vmm` is an ESM SDK and CLI that turns OCI images, Dockerfiles, or Git
+repos into bootable ext4 rootfs images, then runs them through a compact native
+KVM backend. It is built for sandbox-like workloads where Node developers want
+process-shaped ergonomics with VM isolation: run code, boot app servers, publish
+ports, pause/resume, and throw writable overlays away.
+
+The npm release target is Linux/KVM today. Windows Hypervisor Platform support
+is in progress: Windows can build/import the JS package and the experimental WHP
+backend is kept behind a manual native gate.
+
+## Why node-vmm?
+
+- **JS-first API:** import it from TypeScript/JavaScript or use the `node-vmm`
+  CLI.
+- **Real app inputs:** build from OCI images, Dockerfiles, local folders, or Git
+  repos.
+- **No Docker Engine dependency:** the builder pulls OCI layers and assembles
+  rootfs images directly.
+- **Docker-style ports:** publish guest TCP ports such as `3000:3000`.
+- **Fast warm lifecycle:** pause/resume app VMs and reuse prepared rootfs
+  templates for sandbox-style work.
+- **Release-gated apps:** plain Node, Express, Fastify, Next.js, Vite React, and
+  Vite Vue are booted and checked over HTTP in the KVM gate.
+
+## Performance Snapshot
+
+Fast path first, measured on the local Linux/KVM release host. Warm resume is
+the path to optimize for sandbox-style reuse; cold boot includes guest Linux and
+Node app startup.
+
+| App | Warm resume to HTTP | Cold boot to HTTP |
+| --- | ---: | ---: |
+| Vite React | 5 ms | 2.01 s |
+| Fastify | 8 ms | 1.16 s |
+| plain Node HTTP | 10 ms | 1.15 s |
+| Express | 16 ms | 1.16 s |
+| Vite Vue | 25 ms | 3.31 s |
+| Next.js hello-world | 50 ms | 2.60 s |
+
+Build times depend on network, npm, and OCI cache state; the measured details
+are in [docs/performance.md](docs/performance.md).
+
+## Quick Start
 
 ```bash
 npm install node-vmm
@@ -73,6 +122,17 @@ const sandbox = await kvm.createSandbox({
 const result = await sandbox.process.exec("echo hello");
 await sandbox.delete();
 ```
+
+## Docs At A Glance
+
+- [CLI](#cli)
+- [SDK API](docs/sdk.md)
+- [Dockerfile and framework tutorials](docs/tutorials.md)
+- [Snapshots and pause/resume](docs/snapshots.md)
+- [Testing and release gates](docs/testing.md)
+- [Performance measurements](docs/performance.md)
+- [Publishing checklist](docs/publishing.md)
+- [Windows WHP status](docs/windows.md)
 
 ## Requirements
 

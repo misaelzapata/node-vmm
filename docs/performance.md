@@ -224,6 +224,19 @@ Dockerfile builds, KVM networking, and Docker-style publish `3000` to a random
 host port. Each app was verified over HTTP, paused, checked for blocked HTTP
 while paused, resumed, and verified over HTTP again.
 
+Fast path first:
+
+| App | Warm resume to HTTP | Cold boot to HTTP | Rootfs build |
+| --- | ---: | ---: | ---: |
+| Vite React | 5 ms | 2.01 s | 24.45 s |
+| Fastify | 8 ms | 1.16 s | 13.88 s |
+| plain Node HTTP | 10 ms | 1.15 s | 10.36 s |
+| Express | 16 ms | 1.16 s | 10.83 s |
+| Vite Vue | 25 ms | 3.31 s | 19.69 s |
+| Next.js hello-world | 50 ms | 2.60 s | 24.57 s |
+
+Raw run output:
+
 ```json
 [
   {
