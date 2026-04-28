@@ -82,10 +82,13 @@ The default GitHub Windows job is intentionally able to run on hosted runners:
 ```yaml
 windows:
   runs-on: windows-latest
+  env:
+    NODE_VMM_SKIP_NATIVE: "1"
 ```
 
-It builds the native addon and verifies `probeWhp()`. Full WHP execution belongs
-in the manual self-hosted gate because hosted runners may not expose nested
+It validates the JS package can build, import, and pack on Windows without
+claiming WHP release readiness. Native WHP compilation and execution belong in
+the manual self-hosted gate because hosted runners may not expose nested
 virtualization:
 
 ```yaml
