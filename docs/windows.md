@@ -5,7 +5,7 @@ Linux/KVM is the current npm release runtime. Windows Hypervisor Platform suppor
 is work in progress and lives behind `native/whp_backend.cc`.
 
 ```ts
-import { probeWhp, whpSmokeHlt } from "node-vmm/kvm";
+import { probeWhp, whpSmokeHlt } from "@misaelzapata/node-vmm/kvm";
 
 const probe = probeWhp();
 console.log(probe);

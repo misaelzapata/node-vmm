@@ -7,7 +7,7 @@ export NODE_VMM_KERNEL="$(node-vmm kernel fetch)"
 ```
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 const template = await kvm.prepare({
   image: "alpine:3.20",

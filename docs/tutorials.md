@@ -6,7 +6,7 @@ or local context, and a server listening on `0.0.0.0:3000`.
 ## Linux Setup
 
 ```bash
-npm install node-vmm
+npm install @misaelzapata/node-vmm
 export NODE_VMM_KERNEL="$(node-vmm kernel fetch)"
 sudo -n node-vmm doctor
 ```
@@ -34,8 +34,8 @@ sudo node-vmm run \
 
 ## Next.js
 
-Use Node.js runtime routes only; do not import `node-vmm` from Client Components
-or edge routes.
+Use Node.js runtime routes only; do not import `@misaelzapata/node-vmm` from
+Client Components or edge routes.
 
 ```Dockerfile
 FROM node:22-alpine
@@ -109,7 +109,7 @@ file, and run `node server.mjs`.
 ## SDK Server Route
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 export async function POST(request: Request) {
   const { code } = await request.json();

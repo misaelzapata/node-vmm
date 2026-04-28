@@ -109,7 +109,7 @@ Common flags:
   --cache-dir DIR       OCI blob cache (default: /tmp/node-vmm/oci-cache)
   --arch ARCH           OCI architecture (default: host arch)
   --mem MIB             guest memory (default: 256)
-  --cpus N              vCPU count (default: 1)
+  --cpus N              vCPU count; v0.1 runtime accepts 1 (default: 1)
   --net auto|none|tap   network mode (default: auto)
   --tap NAME            existing/created TAP name for --net tap or auto
   -p, --publish SPEC    Docker-style TCP publish: [IP:]HOST:CONTAINER[/tcp]

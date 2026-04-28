@@ -7,7 +7,7 @@ local regeneration sources under `.node-vmm-demo/`, which is ignored by Git.
 
 The commands shown in the tape are the intended first-run flow:
 
-1. Install `node-vmm`.
+1. Install `@misaelzapata/node-vmm`.
 2. Inspect host/runtime features.
 3. Show a real Git repository with `app/Dockerfile`, `app/package.json`, and
    `app/app.js`.

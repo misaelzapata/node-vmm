@@ -10,6 +10,7 @@ const targets = [
   ".nyc_output",
   ".node-vmm",
   "node-vmm-0.1.0.tgz",
+  "misaelzapata-node-vmm-0.1.0.tgz",
   path.join(os.tmpdir(), "node-vmm"),
 ];
 
@@ -46,7 +47,11 @@ for (const target of targets) {
 }
 
 for (const entry of await readdir(root)) {
-  if (/^node-vmm-\d+\.\d+\.\d+\.tgz$/.test(entry) || entry.endsWith(".ext4") || entry.endsWith(".gcov")) {
+  if (
+    /^(?:node-vmm|misaelzapata-node-vmm)-\d+\.\d+\.\d+\.tgz$/.test(entry) ||
+    entry.endsWith(".ext4") ||
+    entry.endsWith(".gcov")
+  ) {
     await remove(path.join(root, entry));
   }
 }

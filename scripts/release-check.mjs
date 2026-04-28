@@ -35,7 +35,7 @@ function runRealAppsGate() {
 }
 
 try {
-  const packageName = "node-vmm";
+  const packageName = "@misaelzapata/node-vmm";
   const view = spawnSync("npm", ["view", packageName, "version"], {
     encoding: "utf8",
     env: npmEnv,
@@ -55,7 +55,7 @@ try {
   run("npm", ["run", "test:js-apps"]);
   runRealAppsGate();
   run("npm", ["run", "pack:check"]);
-  execFileSync("npm", ["publish", "--dry-run", "--ignore-scripts"], {
+  execFileSync("npm", ["publish", "--dry-run", "--ignore-scripts", "--access", "public"], {
     env: npmEnv,
     stdio: "inherit",
   });

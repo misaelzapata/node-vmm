@@ -22,7 +22,7 @@ sudo chown "$USER:$USER" ./node22.ext4
 ```
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 const result = await kvm.runCode({
   rootfsPath: "./node22.ext4",
@@ -41,7 +41,7 @@ automatic TAP/NAT networking.
 ## Simple API
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 const vm = await kvm.run({
   image: "alpine:3.20",
@@ -73,7 +73,7 @@ The default export is the easiest path. It has:
 Creates a client with shared defaults:
 
 ```ts
-import { createNodeVmmClient } from "node-vmm";
+import { createNodeVmmClient } from "@misaelzapata/node-vmm";
 
 const kvm = createNodeVmmClient({
   cwd: process.cwd(),
@@ -95,7 +95,7 @@ sudo -n node-vmm doctor
 From JS/TS you can also fetch it directly:
 
 ```ts
-import { fetchGocrackerKernel } from "node-vmm/kernel";
+import { fetchGocrackerKernel } from "@misaelzapata/node-vmm/kernel";
 
 const kernel = await fetchGocrackerKernel();
 process.env.NODE_VMM_KERNEL = kernel.path;
@@ -345,7 +345,7 @@ const result = await kvm.restoreSnapshot({
 The short named exports are also available:
 
 ```ts
-import { boot, build, code, createSnapshot, prepare, restoreSnapshot, run } from "node-vmm";
+import { boot, build, code, createSnapshot, prepare, restoreSnapshot, run } from "@misaelzapata/node-vmm";
 ```
 
 The older explicit names remain available for readability in larger codebases:
@@ -355,35 +355,35 @@ The older explicit names remain available for readability in larger codebases:
 
 Advanced modules are public and typed:
 
-- `node-vmm/kvm`
-- `node-vmm/kernel`
-- `node-vmm/native`
-- `node-vmm/oci`
-- `node-vmm/rootfs`
-- `node-vmm/net`
-- `node-vmm/process`
-- `node-vmm/utils`
-- `node-vmm/types`
+- `@misaelzapata/node-vmm/kvm`
+- `@misaelzapata/node-vmm/kernel`
+- `@misaelzapata/node-vmm/native`
+- `@misaelzapata/node-vmm/oci`
+- `@misaelzapata/node-vmm/rootfs`
+- `@misaelzapata/node-vmm/net`
+- `@misaelzapata/node-vmm/process`
+- `@misaelzapata/node-vmm/utils`
+- `@misaelzapata/node-vmm/types`
 
 ## Next.js Server-Only Usage
 
-Keep `node-vmm` on the server. Add this to `next.config.mjs`:
+Keep `@misaelzapata/node-vmm` on the server. Add this to `next.config.mjs`:
 
 ```js
 export default {
-  serverExternalPackages: ["node-vmm"],
+  serverExternalPackages: ["@misaelzapata/node-vmm"],
 };
 ```
 
 Use it from route handlers or server actions:
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 export async function GET() {
   return Response.json(kvm.features());
 }
 ```
 
-Do not import `node-vmm` from client components; the package includes a native
-KVM addon and Linux host operations.
+Do not import `@misaelzapata/node-vmm` from client components; the package
+includes a native KVM addon and Linux host operations.

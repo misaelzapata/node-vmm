@@ -1,10 +1,10 @@
 {
-  "name": "node-vmm",
+  "name": "@misaelzapata/node-vmm",
   "version": "0.1.0",
   "description": "A TypeScript/JavaScript SDK and CLI for running small hypervisor-backed microVMs from OCI images.",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://www.npmjs.com/package/node-vmm",
+  "homepage": "https://www.npmjs.com/package/@misaelzapata/node-vmm",
   "bugs": {
     "url": "https://github.com/misaelzapata/node-vmm/issues"
   },

@@ -1,9 +1,9 @@
 # node-vmm
 
 [![CI](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
-[![npm downloads](https://img.shields.io/npm/dm/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
-[![Node.js](https://img.shields.io/node/v/node-vmm.svg?style=flat)](https://www.npmjs.com/package/node-vmm)
+[![npm version](https://img.shields.io/npm/v/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
+[![npm downloads](https://img.shields.io/npm/dm/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
+[![Node.js](https://img.shields.io/node/v/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
 [![Types](https://img.shields.io/badge/types-TypeScript-blue.svg?style=flat)](docs/sdk.md)
 [![ESM only](https://img.shields.io/badge/module-ESM%20only-4b32c3.svg?style=flat)](docs/sdk.md)
@@ -58,7 +58,7 @@ are in [docs/performance.md](docs/performance.md).
 ## Quick Start
 
 ```bash
-npm install node-vmm
+npm install @misaelzapata/node-vmm
 
 export NODE_VMM_KERNEL="$(node-vmm kernel fetch)"
 sudo -n node-vmm doctor
@@ -72,7 +72,7 @@ network setup, and most VM runs. Use passwordless `sudo -n` in CI/release gates;
 interactive local runs can use regular `sudo`.
 
 ```ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 const result = await kvm.run({
   image: "alpine:3.20",
@@ -161,6 +161,7 @@ Linux runtime:
 | Run a prepared rootfs with `--net none` | Yes | Yes | No, if user can open `/dev/kvm` |
 | Run web apps with `--net auto -p 3000:3000` | Yes | Yes | Yes |
 | Next.js, Vite React/Vue, Express, Fastify app servers | Yes | Yes | Yes |
+| Multi-vCPU runtime with `--cpus > 1` | Not yet | Yes | Depends on network/rootfs setup |
 | Windows WHP runtime | In progress | Host WHP | No Linux sudo |
 
 Windows work in progress:
@@ -223,13 +224,13 @@ and decompressed kernel size.
 Install it globally, run it with `npx`, or use the local project binary:
 
 ```bash
-npm install -g node-vmm
+npm install -g @misaelzapata/node-vmm
 node-vmm --help
 
-npx node-vmm kernel fetch
+npx @misaelzapata/node-vmm kernel fetch
 
-npm install node-vmm
-npx node-vmm features
+npm install @misaelzapata/node-vmm
+npx @misaelzapata/node-vmm features
 ```
 
 ```bash
@@ -325,7 +326,7 @@ Use `node-vmm` only from server code. For example, an App Router route handler:
 
 ```ts
 // app/api/sandbox/route.ts
-import kvm from "node-vmm";
+import kvm from "@misaelzapata/node-vmm";
 
 export const runtime = "nodejs";
 
@@ -356,8 +357,8 @@ export NODE_VMM_KERNEL="$(node-vmm kernel fetch)"
 npm run dev
 ```
 
-Do not import `node-vmm` from Client Components or edge routes; the native addon
-belongs in the Node.js server runtime.
+Do not import `@misaelzapata/node-vmm` from Client Components or edge routes;
+the native addon belongs in the Node.js server runtime.
 
 ## Framework Apps
 
@@ -377,15 +378,15 @@ code.
 Subpath exports are also available for advanced users:
 
 ```ts
-import { pullOciImage } from "node-vmm/oci";
-import { buildRootfs } from "node-vmm/rootfs";
-import { runKvmVm } from "node-vmm/kvm";
+import { pullOciImage } from "@misaelzapata/node-vmm/oci";
+import { buildRootfs } from "@misaelzapata/node-vmm/rootfs";
+import { runKvmVm } from "@misaelzapata/node-vmm/kvm";
 ```
 
 `node-vmm` is ESM-only. CommonJS projects can use dynamic import:
 
 ```js
-const { features } = await import("node-vmm");
+const { features } = await import("@misaelzapata/node-vmm");
 ```
 
 For full API notes, Next.js usage, testing, and publishing, see:
@@ -402,7 +403,7 @@ For full API notes, Next.js usage, testing, and publishing, see:
 
 ## Current v1 Support
 
-- x86_64 KVM on Linux, one vCPU
+- x86_64 KVM on Linux, one active vCPU
 - experimental WHP backend work for Windows
 - ELF `vmlinux` kernels
 - UART console with batch and interactive modes
@@ -412,6 +413,10 @@ For full API notes, Next.js usage, testing, and publishing, see:
 - virtio-mmio network through TAP/NAT
 - OCI manifest/index resolution, gzip layers, cache, and basic whiteouts
 - Dockerfile builds for common Node/JS app patterns without Docker Engine
+
+`--cpus` / `cpus` is wired through the CLI, SDK, and snapshot manifests, but the
+native Linux runtime rejects values above `1` until the multi-vCPU loop is
+complete.
 
 Next release work: full WHP boot parity, broader Dockerfile instruction
 coverage, migration, jailer, multi-vCPU execution, bzImage boot, and the
