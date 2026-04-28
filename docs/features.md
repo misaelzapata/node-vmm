@@ -12,7 +12,7 @@ work in progress.
 | OCI image rootfs | Available | Pulls layers directly from registries, no Docker Engine required. |
 | Dockerfile rootfs | Available | Supports common JS app Dockerfiles and multi-stage `COPY --from`. |
 | Git repository builds | Available | `--repo`, `--ref`, and `--subdir` clone to temp storage before build. |
-| JavaScript app servers | Available | Tested with Next.js, Vite React, and Vite Vue via Dockerfile builds. |
+| JavaScript app servers | Available | Release gate covers plain Node, Express, Fastify, Next.js, Vite React, and Vite Vue. |
 | Docker-style TCP ports | Available | `-p 3000`, `-p 8080:3000`, `-p 127.0.0.1:8080:3000/tcp`. |
 | Rootless run from prepared disk | Available | Works with `/dev/kvm` access, `--net none`, and a prebuilt rootfs. |
 | Live VM handle | Available | `startVm()`, `pause()`, `resume()`, `stop()`, `wait()`. |

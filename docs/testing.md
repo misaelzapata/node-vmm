@@ -9,6 +9,7 @@ npm run test:coverage
 npm run test:e2e
 npm run test:consumers
 npm run test:js-apps
+npm run test:real-apps
 npm run bench:node-code
 ```
 
@@ -132,6 +133,38 @@ the default fallback nameserver.
 The script creates its contexts under `/tmp/node-vmm-js-apps-*`, builds ext4
 rootfs images with `--dockerfile`, and removes contexts, caches, and disks in
 `finally`.
+
+## Real Framework App E2E
+
+`npm run test:real-apps` is the release gate for real server apps. It requires
+Linux/KVM, `sudo -n`, network access, Node 20.19 or newer, and
+`NODE_VMM_KERNEL`. Preserve `PATH` when invoking it through `sudo`; otherwise a
+system Node may be used instead of the project toolchain.
+
+```bash
+export NODE_VMM_KERNEL="$(npm run -s kernel:fetch)"
+sudo -n env PATH="$PATH" NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps
+```
+
+The gate builds and boots:
+
+- plain Node HTTP on `node:22-alpine`
+- Express
+- Fastify
+- official Next.js hello-world via `create-next-app@16.2.4`
+- Vite React via `create-vite@9.0.6 --template react`
+- Vite Vue via `create-vite@9.0.6 --template vue`
+
+Every case builds a rootfs from a Dockerfile, publishes guest port `3000`, waits
+for HTTP on the random host port, pauses the VM, verifies HTTP blocks while
+paused, resumes the VM, verifies HTTP again, and stops the VM. Use
+`NODE_VMM_REAL_APP_CASES=next-hello-world,vite-react` to run a subset while
+debugging.
+
+The script uses only temporary npm and OCI caches under
+`/tmp/node-vmm-real-apps-*`; it does not use the user's global npm cache. It
+removes generated apps, rootfs disks, caches, and overlays in `finally`, with a
+`sudo -n rm -rf` fallback for root-owned build artifacts.
 
 ## Node Code Benchmark
 

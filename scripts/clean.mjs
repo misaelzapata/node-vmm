@@ -52,7 +52,11 @@ for (const entry of await readdir(root)) {
 }
 
 for (const entry of await readdir(os.tmpdir())) {
-  if (/^node-vmm-(bench|build|consumers|dockerfile|hot-sandbox|js-apps|node-code|restore-bench|result|run|snapshot|template|overlay)-/.test(entry)) {
+  if (
+    /^node-vmm-(bench|build|consumers|dockerfile|hot-sandbox|js-apps|node-code|real-apps|release-npm-cache|restore-bench|result|run|snapshot|template|overlay)-/.test(
+      entry,
+    )
+  ) {
     await remove(path.join(os.tmpdir(), entry));
   }
 }

@@ -106,6 +106,9 @@ async function listen(server: net.Server, host: string, port: number): Promise<n
 }
 
 async function closeServer(server: net.Server): Promise<void> {
+  if (!server.listening) {
+    return;
+  }
   await new Promise<void>((resolve) => {
     server.close(() => resolve());
   });
@@ -117,18 +120,30 @@ async function setupPortForwards(
 ): Promise<{ ports: PortForward[]; cleanup: () => Promise<void> }> {
   const requested = (inputs ?? []).map(parsePortForward);
   const servers: net.Server[] = [];
+  const sockets = new Set<net.Socket>();
   const active: PortForward[] = [];
 
   try {
     for (const mapping of requested) {
       const server = net.createServer((client) => {
         const upstream = net.connect({ host: guestIp, port: mapping.guestPort });
+        sockets.add(client);
+        sockets.add(upstream);
+        client.once("close", () => sockets.delete(client));
+        upstream.once("close", () => sockets.delete(upstream));
+        let closing = false;
         const closeBoth = (): void => {
+          if (closing) {
+            return;
+          }
+          closing = true;
           client.destroy();
           upstream.destroy();
         };
         client.on("error", closeBoth);
         upstream.on("error", closeBoth);
+        client.on("close", closeBoth);
+        upstream.on("close", closeBoth);
         client.pipe(upstream);
         upstream.pipe(client);
       });
@@ -145,7 +160,11 @@ async function setupPortForwards(
   return {
     ports: active,
     cleanup: async () => {
-      await Promise.all(servers.map((server) => closeServer(server).catch(() => undefined)));
+      const closed = Promise.all(servers.map((server) => closeServer(server).catch(() => undefined)));
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await closed;
     },
   };
 }

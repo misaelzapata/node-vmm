@@ -91,6 +91,18 @@ Linux runtime:
 - Kernel downloads are SHA-256 checked. For custom kernel URLs, set
   `NODE_VMM_KERNEL_SHA256` or publish a `.sha256` sidecar next to the `.gz`.
 
+## What Can Run
+
+| Workflow | Works today | Needs KVM | Needs sudo |
+| --- | --- | --- | --- |
+| Import SDK / inspect `features()` | Yes | No | No |
+| Build from OCI image or Dockerfile | Yes | No | Yes, for ext4 mount/chroot |
+| Build from Git repo with `--repo` | Yes | No | Yes, for ext4 mount/chroot |
+| Run a prepared rootfs with `--net none` | Yes | Yes | No, if user can open `/dev/kvm` |
+| Run web apps with `--net auto -p 3000:3000` | Yes | Yes | Yes |
+| Next.js, Vite React/Vue, Express, Fastify app servers | Yes | Yes | Yes |
+| Windows WHP runtime | In progress | Host WHP | No Linux sudo |
+
 Windows work in progress:
 
 - Windows 11 or Windows Server with Windows Hypervisor Platform enabled
@@ -287,6 +299,21 @@ npm run dev
 Do not import `node-vmm` from Client Components or edge routes; the native addon
 belongs in the Node.js server runtime.
 
+## Framework Apps
+
+For app servers, build from the app's Dockerfile and publish the HTTP port:
+
+```bash
+sudo node-vmm build --dockerfile Dockerfile --context . --output ./app.ext4 --disk 4096
+sudo node-vmm run --rootfs ./app.ext4 --net auto -p 3000:3000 --sandbox --timeout-ms 0
+curl http://127.0.0.1:3000
+```
+
+The release gate boots real generated apps for plain Node HTTP, Express,
+Fastify, Next.js, Vite React, and Vite Vue. See
+[Framework tutorials](docs/tutorials.md) for Dockerfile templates and server
+code.
+
 Subpath exports are also available for advanced users:
 
 ```ts
@@ -305,6 +332,7 @@ For full API notes, Next.js usage, testing, and publishing, see:
 
 - [SDK API](docs/sdk.md)
 - [Feature matrix](docs/features.md)
+- [Framework tutorials](docs/tutorials.md)
 - [Launch demo](docs/demo.md)
 - [Testing and coverage](docs/testing.md)
 - [Performance](docs/performance.md)

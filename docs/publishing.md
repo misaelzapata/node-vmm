@@ -10,12 +10,20 @@ npm run clean
 npm run test:coverage
 npm run test:e2e
 npm run test:consumers
+npm run test:js-apps
+sudo -n env PATH="$PATH" NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps
 npm run pack:check
-npm publish --dry-run
+npm publish --dry-run --ignore-scripts
 ```
 
 `npm run release:check` runs the full checklist and verifies that the `node-vmm`
-package name is still available in the registry before publishing.
+package name is still available in the registry before publishing. Run it on a
+self-hosted Linux/KVM release machine with `/dev/kvm`, passwordless `sudo -n`,
+network access, Node 20.19 or newer, and `NODE_VMM_KERNEL` set. If you launch
+it through `sudo`, preserve `PATH` so the same Node/npm toolchain is used.
+When run as a normal user, `release:check` invokes only `test:real-apps`
+through `sudo -n env PATH="$PATH" ...` because rootfs Dockerfile builds need
+mount privileges.
 
 ## Package Contents
 
@@ -29,7 +37,9 @@ package name is still available in the registry before publishing.
 - `README.md`
 - `LICENSE`
 - `docs`
-- `vhs/launch.tape`
 
 It must not include `build/`, `src/`, `test/`, `dist/test/`, caches, rootfs
-images, or local coverage output.
+images, VHS tape/script sources, or local coverage output.
+
+The launch GIF may be published as documentation under `docs/assets/`; the
+source tape/scripts stay outside Git under `.node-vmm-demo/`.

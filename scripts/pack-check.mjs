@@ -10,9 +10,12 @@ const forbidden = [
   /^dist\/test\//,
   /^node_modules\//,
   /^coverage\//,
+  /^vhs\//,
   /^\.nyc_output\//,
   /__pycache__\//,
   /\.pyc$/,
+  /\.tape$/,
+  /\.expect$/,
   /^package-lock\.json$/,
 ];
 

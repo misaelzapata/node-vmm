@@ -61,13 +61,13 @@ For real JavaScript app smoke tests:
 ```bash
 export NODE_VMM_KERNEL="$(npm run -s kernel:fetch)"
 npm run build
-sudo -n env NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps
+sudo -n env PATH="$PATH" NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps
 ```
 
-That smoke test generates official app examples, builds them into rootfs images
+That smoke test generates real framework apps, builds them into rootfs images
 from Dockerfiles, publishes Docker-style port `3000`, verifies HTTP, pauses the
 VM, verifies HTTP blocks while paused, resumes it, verifies HTTP again, and
-cleans all temporary apps, caches, and disks.
+cleans all temporary apps, npm caches, OCI caches, and disks.
 
 ## Latest Local Boot/Run Result
 
@@ -218,44 +218,79 @@ the warm lifecycle overhead.
 
 ## Latest Real JavaScript App Result
 
-Measured on 2026-04-28 with official generated apps, `node:22-alpine`,
+Measured on 2026-04-28 with `sudo -n env PATH="$PATH"
+NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps`, `node:22-alpine`,
 Dockerfile builds, KVM networking, and Docker-style publish `3000` to a random
-host port:
+host port. Each app was verified over HTTP, paused, checked for blocked HTTP
+while paused, resumed, and verified over HTTP again.
 
 ```json
 [
   {
-    "app": "next-hello-world",
-    "buildMs": 18175,
-    "bootToHttpMs": 1428,
-    "firstHttpMs": 1428,
-    "pauseMs": 1,
-    "resumeToHttpMs": 12,
+    "app": "plain-node",
+    "buildMs": 10364,
+    "bootToHttpMs": 1150,
+    "resumeToHttpMs": 10,
+    "pauseMs": 6,
     "pausedHttpBlocked": true,
     "stopExitReason": "host-stop",
-    "htmlMarker": "<h1>Hello, Next.js!</h1>"
+    "htmlMarker": "plain-node-ok",
+    "resumedMarker": "plain-node-ok"
+  },
+  {
+    "app": "express",
+    "buildMs": 10834,
+    "bootToHttpMs": 1159,
+    "resumeToHttpMs": 16,
+    "pauseMs": 6,
+    "pausedHttpBlocked": true,
+    "stopExitReason": "host-stop",
+    "htmlMarker": "express-ok",
+    "resumedMarker": "express-ok"
+  },
+  {
+    "app": "fastify",
+    "buildMs": 13876,
+    "bootToHttpMs": 1155,
+    "resumeToHttpMs": 8,
+    "pauseMs": 3,
+    "pausedHttpBlocked": true,
+    "stopExitReason": "host-stop",
+    "htmlMarker": "fastify-ok",
+    "resumedMarker": "fastify-ok"
+  },
+  {
+    "app": "next-hello-world",
+    "buildMs": 24566,
+    "bootToHttpMs": 2597,
+    "resumeToHttpMs": 50,
+    "pauseMs": 9,
+    "pausedHttpBlocked": true,
+    "stopExitReason": "host-stop",
+    "htmlMarker": "<h1>Hello, Next.js!</h1>",
+    "resumedMarker": "<h1>Hello, Next.js!</h1>"
   },
   {
     "app": "vite-react",
-    "buildMs": 18326,
-    "bootToHttpMs": 1367,
-    "firstHttpMs": 1367,
-    "pauseMs": 1,
+    "buildMs": 24454,
+    "bootToHttpMs": 2011,
     "resumeToHttpMs": 5,
+    "pauseMs": 2,
     "pausedHttpBlocked": true,
     "stopExitReason": "host-stop",
-    "htmlMarker": "<title>vite-react</title>"
+    "htmlMarker": "<title>vite-react</title>",
+    "resumedMarker": "<title>vite-react</title>"
   },
   {
     "app": "vite-vue",
-    "buildMs": 12862,
-    "bootToHttpMs": 1360,
-    "firstHttpMs": 1360,
-    "pauseMs": 13,
-    "resumeToHttpMs": 24,
+    "buildMs": 19686,
+    "bootToHttpMs": 3310,
+    "resumeToHttpMs": 25,
+    "pauseMs": 14,
     "pausedHttpBlocked": true,
     "stopExitReason": "host-stop",
-    "htmlMarker": "<title>vite-vue</title>"
+    "htmlMarker": "<title>vite-vue</title>",
+    "resumedMarker": "<title>vite-vue</title>"
   }
 ]
 ```

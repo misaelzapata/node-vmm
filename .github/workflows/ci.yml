@@ -69,4 +69,5 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci --ignore-scripts
+      - run: echo "NODE_VMM_KERNEL=$(npm run -s kernel:fetch)" >> "$GITHUB_ENV"
       - run: npm run release:check
