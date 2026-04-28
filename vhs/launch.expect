@@ -44,8 +44,20 @@ sh "rm -rf $base && mkdir -p $base/repo/app $base/bin"
 
 set dockerfile [open "$base/repo/app/Dockerfile" w]
 puts $dockerfile "FROM node:22-alpine"
-puts $dockerfile "CMD /bin/sh"
+puts $dockerfile "WORKDIR /workspace"
+puts $dockerfile "COPY package.json app.js ./"
+puts $dockerfile "ENV NODE_ENV=production"
+puts $dockerfile "CMD \[\"node\", \"/workspace/app.js\"\]"
 close $dockerfile
+
+set packagejson [open "$base/repo/app/package.json" w]
+puts $packagejson "\{\"name\":\"node-vmm-demo-app\",\"type\":\"module\",\"private\":true\}"
+close $packagejson
+
+set appjs [open "$base/repo/app/app.js" w]
+puts $appjs "console.log(\"node-vmm repo demo\", 21 * 2);"
+puts $appjs "console.log(\"cwd\", process.cwd());"
+close $appjs
 
 set wrapper [open "$base/bin/node-vmm" w]
 puts $wrapper "#!/bin/sh"
@@ -57,10 +69,25 @@ set env(PATH) "$base/bin:$env(PATH)"
 sh "git -C $base/repo init -q"
 sh "git -C $base/repo config user.email node-vmm@example.invalid"
 sh "git -C $base/repo config user.name node-vmm"
-sh "git -C $base/repo add app/Dockerfile"
-sh "git -C $base/repo commit -q -m init"
+sh "git -C $base/repo add app/Dockerfile app/app.js app/package.json"
+sh "git -C $base/repo commit -q -m dockerized-node-app"
 
 run_wait "node-vmm features | sed -n '1,8p'" "node-vmm features | sed -n '1,8p'" "rootfs:"
+
+run_wait \
+  "cd /tmp/nv-demo/repo && find app -maxdepth 2 -type f | sort" \
+  "cd $base/repo && find app -maxdepth 2 -type f | sort" \
+  "app/package.json"
+
+run_wait \
+  "sed -n '1,8p' app/Dockerfile" \
+  "cd $base/repo && sed -n '1,8p' app/Dockerfile" \
+  "CMD"
+
+run_wait \
+  "sed -n '1,8p' app/app.js" \
+  "cd $base/repo && sed -n '1,8p' app/app.js" \
+  "repo demo"
 
 type_line "$ export NODE_VMM_KERNEL=\$(node-vmm kernel fetch)"
 set env(NODE_VMM_KERNEL) [string trim [exec node "$root/dist/src/main.js" kernel fetch]]

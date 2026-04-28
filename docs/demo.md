@@ -17,11 +17,13 @@ actual build and VM output before moving to the next command.
 The commands shown in the tape are the intended first-run flow:
 
 1. Install `node-vmm`.
-2. Fetch the guest kernel.
-3. Inspect host/runtime features.
-4. Build a Node rootfs from a Git repository.
-5. Start the VM in interactive console mode.
-6. Run `node -e "console.log(\"node-vmm\", 21 * 2)"` inside the guest.
+2. Inspect host/runtime features.
+3. Show a real Git repository with `app/Dockerfile`, `app/package.json`, and
+   `app/app.js`.
+4. Fetch the guest kernel.
+5. Build a Node rootfs from that Git repository.
+6. Start the VM in interactive console mode.
+7. Run `node /workspace/app.js` inside the guest.
 
 Real KVM app execution still requires Linux, `/dev/kvm`, and root privileges for
 rootfs mount/network setup.

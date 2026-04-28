@@ -65,15 +65,15 @@ def main() -> int:
                     type_bytes(master, b"printf '\\033[2J\\033[H'\n")
                     sent_clear = True
                     clear_time = time.time()
-                if sent_node and not sent_exit and b"node-vmm" in buf and b"42" in buf:
+                if sent_node and not sent_exit and b"node-vmm repo demo" in buf and b"42" in buf:
                     time.sleep(0.25)
                     type_bytes(master, b"exit\n")
                     sent_exit = True
-                if b"node-vmm" in buf and b"42" in buf and b"stopped:" in buf:
+                if b"node-vmm repo demo" in buf and b"42" in buf and b"stopped:" in buf:
                     ok = True
                     break
             if sent_clear and not sent_node and time.time() - clear_time > 0.8:
-                type_bytes(master, b'node -e "console.log(\\"node-vmm\\", 21 * 2)"\n')
+                type_bytes(master, b"node /workspace/app.js\n")
                 sent_node = True
             if proc.poll() is not None:
                 break
