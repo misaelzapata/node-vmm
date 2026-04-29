@@ -24,6 +24,48 @@ The benchmark:
 - records total time, first-output time, KVM run count, and stdout size
 - deletes all generated cache and disk artifacts afterward
 
+Normal CLI/SDK runs are warmer than this benchmark after the first build because
+`run --image` reuses prepared ext4 rootfs images from `--cache-dir/rootfs`.
+That is a prepared-rootfs cache, not pause/resume: it still boots Linux for each
+run, but skips OCI extraction and rootfs materialization. The benchmark
+intentionally clears that cache when it wants a cold measurement.
+
+## Latest `run --image` Rootfs Cache Result
+
+Measured on 2026-04-28 on the local Linux/KVM release host with `sudo -n`,
+`NODE_VMM_KERNEL` set to the fetched default kernel, `--net none`, and temporary
+cache directories deleted after the run.
+
+Fastest prepared-rootfs cache path first:
+
+| Path | Image / command | Cache | Exit | KVM_RUN | Wall time |
+| --- | --- | --- | --- | ---: | ---: |
+| Warm cached rootfs | `alpine:3.20`, `echo` | hit | halted-console | 1070-1074 | 330-519 ms |
+| Warm cached rootfs + `--fast-exit` | `alpine:3.20`, `echo` | hit | guest-exit | 962-966 | 357-416 ms |
+| Warm cached rootfs | `node:22-alpine`, `node -e` | hit | halted-console | 2593 | 551-630 ms |
+| Warm cached rootfs + `--fast-exit` | `node:22-alpine`, `node -e` | hit | guest-exit | 2481 | 776-796 ms |
+| Cold build into cache | `alpine:3.20`, `echo` | miss | halted-console | 1074 | 4.091 s |
+| Cold build into cache | `node:22-alpine`, `node -e` | miss | halted-console | 2593 | 9.498 s |
+
+Raw samples:
+
+```json
+[
+  {"label":"cold-build-cache","ms":4091,"cacheState":"miss","exitReason":"halted-console","runs":"1074","ok":true},
+  {"label":"warm-1","ms":519,"cacheState":"hit","exitReason":"halted-console","runs":"1070","ok":true},
+  {"label":"warm-2","ms":330,"cacheState":"hit","exitReason":"halted-console","runs":"1070","ok":true},
+  {"label":"warm-3","ms":362,"cacheState":"hit","exitReason":"halted-console","runs":"1074","ok":true},
+  {"label":"warm-fast-1","ms":416,"cacheState":"hit","exitReason":"guest-exit","runs":"962","ok":true},
+  {"label":"warm-fast-2","ms":392,"cacheState":"hit","exitReason":"guest-exit","runs":"962","ok":true},
+  {"label":"warm-fast-3","ms":357,"cacheState":"hit","exitReason":"guest-exit","runs":"966","ok":true},
+  {"label":"node-cold-build-cache","ms":9498,"cacheState":"miss","exitReason":"halted-console","runs":"2593","ok":true},
+  {"label":"node-warm-1","ms":551,"cacheState":"hit","exitReason":"halted-console","runs":"2593","ok":true},
+  {"label":"node-warm-2","ms":630,"cacheState":"hit","exitReason":"halted-console","runs":"2593","ok":true},
+  {"label":"node-warm-fast-1","ms":776,"cacheState":"hit","exitReason":"guest-exit","runs":"2481","ok":true},
+  {"label":"node-warm-fast-2","ms":796,"cacheState":"hit","exitReason":"guest-exit","runs":"2481","ok":true}
+]
+```
+
 Restore-specific measurements use:
 
 ```bash
@@ -214,7 +256,8 @@ and host publish `18181:3000`:
 worker. `pause()` interrupts the runner and stops entering `KVM_RUN`;
 `resume()` flips the command back to running; `stop()` exits through the same
 controlled channel. `readyMs` includes build/boot/Node startup; pause/resume are
-the warm lifecycle overhead.
+the already-running VM warm lifecycle overhead. This is separate from the
+prepared-rootfs cache above.
 
 ## Latest Real JavaScript App Result
 
@@ -224,9 +267,9 @@ Dockerfile builds, KVM networking, and Docker-style publish `3000` to a random
 host port. Each app was verified over HTTP, paused, checked for blocked HTTP
 while paused, resumed, and verified over HTTP again.
 
-Fast path first:
+Fast pause/resume path first:
 
-| App | Warm resume to HTTP | Cold boot to HTTP | Rootfs build |
+| App | Pause/resume to HTTP | Cold boot to HTTP | Rootfs build |
 | --- | ---: | ---: | ---: |
 | Vite React | 5 ms | 2.01 s | 24.45 s |
 | Fastify | 8 ms | 1.16 s | 13.88 s |

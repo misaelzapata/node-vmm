@@ -106,7 +106,7 @@ Common flags:
   --entrypoint STRING   entrypoint override
   --workdir DIR         working directory override
   --env KEY=VALUE       guest env, repeatable or comma-separated
-  --cache-dir DIR       OCI blob cache (default: /tmp/node-vmm/oci-cache)
+  --cache-dir DIR       OCI blob and prepared-rootfs cache (default: /tmp/node-vmm/oci-cache)
   --arch ARCH           OCI architecture (default: host arch)
   --mem MIB             guest memory (default: 256)
   --cpus N              vCPU count, 1-64 (default: 1)

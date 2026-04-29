@@ -1,4 +1,5 @@
-import { copyFile, link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -51,10 +52,11 @@ export * from "./rootfs.js";
 export * from "./types.js";
 export * from "./utils.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 const PRODUCT_NAME = "node-vmm";
 const DEFAULT_CACHE_DIR = path.join(os.tmpdir(), PRODUCT_NAME, "oci-cache");
+const ROOTFS_CACHE_VERSION = 1;
 const SNAPSHOT_MANIFEST = "snapshot.json";
 
 function hostBackend(): "kvm" | "whp" | "unsupported" {
@@ -354,6 +356,103 @@ async function makeOverlayTempDir(
   return makeTempDirIn(parent, `${PRODUCT_NAME}-overlay-${id}-`);
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function rootfsCacheKey(options: SdkRunOptions | SdkPrepareOptions): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        version: ROOTFS_CACHE_VERSION,
+        image: options.image,
+        diskMiB: diskMiBFromOptions(options, 2048),
+        buildArgs: options.buildArgs ?? {},
+        env: options.env ?? {},
+        entrypoint: options.entrypoint,
+        workdir: options.workdir,
+        initMode: options.initMode,
+        platformArch: options.platformArch,
+        dockerfileRunTimeoutMs: options.dockerfileRunTimeoutMs,
+      }),
+    )
+    .digest("hex");
+}
+
+function isCacheableOciRootfs(options: SdkRunOptions | SdkPrepareOptions, source: { dockerfile?: string }): boolean {
+  return Boolean(
+    options.image &&
+      !options.rootfsPath &&
+      !options.repo &&
+      !options.dockerfile &&
+      !source.dockerfile &&
+      !options.entrypoint,
+  );
+}
+
+async function buildOrReuseRootfs(params: {
+  options: SdkRunOptions | SdkPrepareOptions;
+  source: { contextDir: string; dockerfile?: string };
+  output: string;
+  tempDir: string;
+  cacheDir: string;
+  logger?: (message: string) => void;
+}): Promise<{ rootfsPath: string; fromCache: boolean; built: boolean }> {
+  const cacheable = isCacheableOciRootfs(params.options, params.source);
+  const buildOptions = {
+    image: params.options.image,
+    dockerfile: params.source.dockerfile,
+    contextDir: params.source.contextDir,
+    diskMiB: diskMiBFromOptions(params.options, 2048),
+    buildArgs: params.options.buildArgs ?? {},
+    env: params.options.env ?? {},
+    cmd: cacheable ? undefined : params.options.cmd,
+    entrypoint: params.options.entrypoint,
+    workdir: params.options.workdir,
+    initMode: params.options.initMode,
+    tempDir: params.tempDir,
+    cacheDir: params.cacheDir,
+    platformArch: params.options.platformArch,
+    dockerfileRunTimeoutMs: params.options.dockerfileRunTimeoutMs,
+    signal: params.options.signal,
+  };
+
+  if (!cacheable) {
+    await buildRootfs({ ...buildOptions, output: params.output });
+    return { rootfsPath: params.output, fromCache: false, built: true };
+  }
+
+  const rootfsCacheDir = path.join(params.cacheDir, "rootfs");
+  await mkdir(rootfsCacheDir, { recursive: true, mode: 0o700 });
+  const key = rootfsCacheKey(params.options);
+  const cached = path.join(rootfsCacheDir, `${key}.ext4`);
+  if (await pathExists(cached)) {
+    params.logger?.(`${PRODUCT_NAME} rootfs cache hit: ${cached}`);
+    return { rootfsPath: cached, fromCache: true, built: false };
+  }
+
+  params.logger?.(`${PRODUCT_NAME} rootfs cache miss: ${params.options.image}`);
+  const tmp = path.join(rootfsCacheDir, `${key}.tmp-${process.pid}-${randomId("rootfs")}.ext4`);
+  try {
+    await buildRootfs({ ...buildOptions, output: tmp });
+    await rename(tmp, cached);
+    params.logger?.(`${PRODUCT_NAME} rootfs cached: ${cached}`);
+    return { rootfsPath: cached, fromCache: true, built: true };
+  } catch (error) {
+    await rm(tmp, { force: true });
+    throw error;
+  }
+}
+
 async function hardlinkOrCopy(source: string, dest: string): Promise<void> {
   try {
     await link(source, dest);
@@ -539,42 +638,38 @@ export async function runImage(
   let overlayPath: string | undefined;
   let overlayTempDir = "";
   let builtRootfs = false;
-  const generatedOverlay = restoreEnabled(options) && !options.overlayPath;
+  let generatedOverlay = false;
 
   try {
     network = await setupVmNetwork({ id, network: networkFromOptions(options), tapName: options.tapName, ports: options.ports });
     rootfsPath = options.rootfsPath ? resolvePath(defaults.cwd, options.rootfsPath) : path.join(tempDir, `${id}.ext4`);
-    overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
-    overlayPath = restoreEnabled(options)
-      ? options.overlayPath
-        ? resolvePath(defaults.cwd, options.overlayPath)
-        : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
-      : undefined;
     builtRootfs = !options.rootfsPath;
+    let rootfsFromCache = false;
     if (builtRootfs) {
       if (!options.image && !options.dockerfile && !options.repo) {
         throw new NodeVmmError("run requires rootfsPath, image, dockerfile, or repo");
       }
       const source = await resolveSourceContext(options, defaults, tempDir);
-      await buildRootfs({
-        image: options.image,
-        dockerfile: source.dockerfile,
-        contextDir: source.contextDir,
+      const prepared = await buildOrReuseRootfs({
+        options: { ...options, initMode: options.initMode ?? (interactive ? "interactive" : "batch") },
+        source,
         output: rootfsPath,
-        diskMiB: diskMiBFromOptions(options, 2048),
-        buildArgs: options.buildArgs ?? {},
-        env: options.env ?? {},
-        cmd: options.cmd,
-        entrypoint: options.entrypoint,
-        workdir: options.workdir,
-        initMode: options.initMode ?? (interactive ? "interactive" : "batch"),
         tempDir,
         cacheDir: resolvePath(defaults.cwd, options.cacheDir || defaults.cacheDir),
-        platformArch: options.platformArch,
-        dockerfileRunTimeoutMs: options.dockerfileRunTimeoutMs,
-        signal: options.signal,
+        logger: defaults.logger,
       });
+      rootfsPath = prepared.rootfsPath;
+      rootfsFromCache = prepared.fromCache;
+      builtRootfs = prepared.built;
     }
+    const needsOverlay = restoreEnabled(options) || rootfsFromCache;
+    generatedOverlay = needsOverlay && !options.overlayPath;
+    overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
+    overlayPath = needsOverlay
+      ? options.overlayPath
+        ? resolvePath(defaults.cwd, options.overlayPath)
+        : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
+      : undefined;
 
     defaults.logger?.(`${PRODUCT_NAME} starting ${id}`);
     if (network.mode === "tap") {
@@ -657,7 +752,7 @@ export async function startVm(
   let overlayPath: string | undefined;
   let overlayTempDir = "";
   let builtRootfs = false;
-  const generatedOverlay = restoreEnabled(options) && !options.overlayPath;
+  let generatedOverlay = false;
   let cleaned = false;
   const cleanup = async (): Promise<void> => {
     if (cleaned) {
@@ -676,37 +771,33 @@ export async function startVm(
   try {
     network = await setupVmNetwork({ id, network: networkFromOptions(options), tapName: options.tapName, ports: options.ports });
     rootfsPath = options.rootfsPath ? resolvePath(defaults.cwd, options.rootfsPath) : path.join(tempDir, `${id}.ext4`);
-    overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
-    overlayPath = restoreEnabled(options)
-      ? options.overlayPath
-        ? resolvePath(defaults.cwd, options.overlayPath)
-        : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
-      : undefined;
     builtRootfs = !options.rootfsPath;
+    let rootfsFromCache = false;
     if (builtRootfs) {
       if (!options.image && !options.dockerfile && !options.repo) {
         throw new NodeVmmError("start requires rootfsPath, image, dockerfile, or repo");
       }
       const source = await resolveSourceContext(options, defaults, tempDir);
-      await buildRootfs({
-        image: options.image,
-        dockerfile: source.dockerfile,
-        contextDir: source.contextDir,
+      const prepared = await buildOrReuseRootfs({
+        options: { ...options, initMode: options.initMode ?? (interactive ? "interactive" : "batch") },
+        source,
         output: rootfsPath,
-        diskMiB: diskMiBFromOptions(options, 2048),
-        buildArgs: options.buildArgs ?? {},
-        env: options.env ?? {},
-        cmd: options.cmd,
-        entrypoint: options.entrypoint,
-        workdir: options.workdir,
-        initMode: options.initMode ?? (interactive ? "interactive" : "batch"),
         tempDir,
         cacheDir: resolvePath(defaults.cwd, options.cacheDir || defaults.cacheDir),
-        platformArch: options.platformArch,
-        dockerfileRunTimeoutMs: options.dockerfileRunTimeoutMs,
-        signal: options.signal,
+        logger: defaults.logger,
       });
+      rootfsPath = prepared.rootfsPath;
+      rootfsFromCache = prepared.fromCache;
+      builtRootfs = prepared.built;
     }
+    const needsOverlay = restoreEnabled(options) || rootfsFromCache;
+    generatedOverlay = needsOverlay && !options.overlayPath;
+    overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
+    overlayPath = needsOverlay
+      ? options.overlayPath
+        ? resolvePath(defaults.cwd, options.overlayPath)
+        : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
+      : undefined;
 
     defaults.logger?.(`${PRODUCT_NAME} starting ${id}`);
     if (network.mode === "tap") {

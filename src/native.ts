@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -144,7 +145,10 @@ function loadNative(): Partial<NativeBackend> {
     return loadedNative;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new NodeVmmError(`native backend unavailable for ${process.platform}/${process.arch}: ${reason}`);
+    const hint = existsSync(addonPath)
+      ? ""
+      : " Run `npm run build:native` from the repository root, or reinstall the package with lifecycle scripts enabled.";
+    throw new NodeVmmError(`native backend unavailable for ${process.platform}/${process.arch}: ${reason}.${hint}`);
   }
 }
 

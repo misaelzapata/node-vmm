@@ -1472,6 +1472,7 @@ class Uart {
   bool echo_stdout_{true};
   KvmSystem* sys_{nullptr};
   std::string console_;
+  char last_stdout_byte_{0};
 	  std::deque<uint8_t> rx_;
 	  std::string terminal_query_;
 	  bool halted_seen_{false};
@@ -1500,9 +1501,22 @@ class Uart {
 	      console_.append(bytes.data(), std::min(available, bytes.size()));
 	    }
     if (echo_stdout_) {
-      ssize_t ignored = ::write(STDOUT_FILENO, bytes.data(), bytes.size());
-      (void)ignored;
+      write_stdout(bytes);
     }
+  }
+
+  void write_stdout(const std::string& bytes) {
+    std::string normalized;
+    normalized.reserve(bytes.size() + 16);
+    for (char byte : bytes) {
+      if (byte == '\n' && last_stdout_byte_ != '\r') {
+        normalized.push_back('\r');
+      }
+      normalized.push_back(byte);
+      last_stdout_byte_ = byte;
+    }
+    ssize_t ignored = ::write(STDOUT_FILENO, normalized.data(), normalized.size());
+    (void)ignored;
   }
 
   void enqueue_rx_locked(const char* data, size_t len, bool front = false) {

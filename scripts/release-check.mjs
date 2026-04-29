@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -35,17 +35,21 @@ function runRealAppsGate() {
 }
 
 try {
-  const packageName = "@misaelzapata/node-vmm";
-  const view = spawnSync("npm", ["view", packageName, "version"], {
+  const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+  const packageName = pkg.name;
+  const packageVersion = pkg.version;
+  const view = spawnSync("npm", ["view", packageName, "versions", "--json"], {
     encoding: "utf8",
     env: npmEnv,
   });
   if (view.status === 0) {
-    throw new Error(`npm package name ${packageName} already exists at version ${view.stdout.trim()}`);
-  }
-  if (!String(view.stderr).includes("E404") && !String(view.stdout).includes("E404")) {
+    const versions = JSON.parse(view.stdout || "[]");
+    if (versions.includes(packageVersion)) {
+      throw new Error(`npm package ${packageName}@${packageVersion} already exists`);
+    }
+  } else if (!String(view.stderr).includes("E404") && !String(view.stdout).includes("E404")) {
     process.stderr.write(view.stderr);
-    throw new Error("could not verify npm package-name availability");
+    throw new Error("could not verify npm package-version availability");
   }
 
   run("npm", ["run", "clean"]);

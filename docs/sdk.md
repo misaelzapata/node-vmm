@@ -82,6 +82,14 @@ const kvm = createNodeVmmClient({
 });
 ```
 
+`cacheDir` stores downloaded OCI blobs and prepared ext4 rootfs images. Repeated
+`runImage({ image: ... })` calls reuse the prepared rootfs when the image,
+disk size, platform, build args, env, workdir, and init mode match. Commands are
+injected at boot, so different `cmd` values can reuse the same cached image.
+Cached rootfs runs automatically use a temporary overlay so guest writes do not
+change the cached base disk. Custom `entrypoint` overrides currently use a
+one-off rootfs.
+
 ### Kernel Helpers
 
 For local development, fetch the default guest kernel once and let SDK/CLI

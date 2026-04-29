@@ -32,18 +32,24 @@ backend is kept behind a manual native gate.
 - **No Docker Engine dependency:** the builder pulls OCI layers and assembles
   rootfs images directly.
 - **Docker-style ports:** publish guest TCP ports such as `3000:3000`.
-- **Fast warm lifecycle:** pause/resume app VMs and reuse prepared rootfs
-  templates for sandbox-style work.
+- **Fast warm lifecycle:** pause/resume already-running app VMs and reuse
+  prepared rootfs templates for repeated boots.
 - **Release-gated apps:** plain Node, Express, Fastify, Next.js, Vite React, and
   Vite Vue are booted and checked over HTTP in the KVM gate.
 
 ## Performance Snapshot
 
-Fast path first, measured on the local Linux/KVM release host. Warm resume is
-the path to optimize for sandbox-style reuse; cold boot includes guest Linux and
-Node app startup.
+Fast path first, measured on the local Linux/KVM release host. There are two
+different warm paths:
 
-| App | Warm resume to HTTP | Cold boot to HTTP |
+- **Pause/resume:** the VM stays alive; `resumeToHttpMs` measures how long it
+  takes an already-started app server to answer after `resume()`.
+- **Prepared rootfs cache:** `run --image` skips OCI extraction and rootfs
+  materialization, but still boots Linux for each run.
+
+Pause/resume timings from real app servers:
+
+| App | Pause/resume to HTTP | Cold boot to HTTP |
 | --- | ---: | ---: |
 | Vite React | 5 ms | 2.01 s |
 | Fastify | 8 ms | 1.16 s |
@@ -51,6 +57,23 @@ Node app startup.
 | Express | 16 ms | 1.16 s |
 | Vite Vue | 25 ms | 3.31 s |
 | Next.js hello-world | 50 ms | 2.60 s |
+
+Prepared rootfs cache timings for `run --image` in the `0.1.1` release
+candidate:
+
+| Path | Image / command | Cache | Wall time |
+| --- | --- | --- | ---: |
+| Warm cached rootfs | `alpine:3.20`, `echo` | hit | 330-519 ms |
+| Warm cached rootfs + `--fast-exit` | `alpine:3.20`, `echo` | hit | 357-416 ms |
+| Warm cached rootfs | `node:22-alpine`, `node -e` | hit | 551-630 ms |
+| Warm cached rootfs + `--fast-exit` | `node:22-alpine`, `node -e` | hit | 776-796 ms |
+| Cold build into cache | `alpine:3.20`, `echo` | miss | 4.091 s |
+| Cold build into cache | `node:22-alpine`, `node -e` | miss | 9.498 s |
+
+Cold runs include `mkfs.ext4`, OCI pull/extract, rootfs materialization, guest
+Linux boot, and command execution. Warm runs reuse the prepared ext4 rootfs from
+`--cache-dir/rootfs` and boot it with a temporary sparse overlay, so guest writes
+do not mutate the cached base.
 
 Build times depend on network, npm, and OCI cache state; the measured details
 are in [docs/performance.md](docs/performance.md).
@@ -202,6 +225,20 @@ node-vmm run \
 Use `--sandbox` for this path: the base rootfs is opened read-only and writes go
 to a user-owned sparse overlay that is deleted afterward. `--net auto` still
 needs `sudo`; use `--net none` for rootless runs.
+
+## Cache And Reuse
+
+`run --image` keeps two caches under `--cache-dir`:
+
+- OCI blobs in `blobs/`
+- prepared ext4 rootfs images in `rootfs/`
+
+The default cache directory is `/tmp/node-vmm/oci-cache`. On a cache hit,
+`node-vmm` boots the cached base rootfs with a temporary sparse overlay, so
+commands like `apk add htop` are fast on repeat runs and do not mutate the base
+image. Use `node-vmm build --output ./app.ext4` plus `run --rootfs ./app.ext4`
+when you want an explicit disk artifact you can move, inspect, or version
+outside the cache.
 
 ## Kernel
 
