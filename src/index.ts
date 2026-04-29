@@ -52,7 +52,7 @@ export * from "./rootfs.js";
 export * from "./types.js";
 export * from "./utils.js";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 
 const PRODUCT_NAME = "node-vmm";
 const DEFAULT_CACHE_DIR = path.join(os.tmpdir(), PRODUCT_NAME, "oci-cache");

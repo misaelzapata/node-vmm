@@ -1,9 +1,9 @@
 # node-vmm
 
 [![CI](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/misaelzapata/node-vmm/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
-[![npm downloads](https://img.shields.io/npm/dm/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
-[![Node.js](https://img.shields.io/node/v/@misaelzapata/node-vmm.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
+[![npm version](https://img.shields.io/badge/npm-v0.1.3-cb3837.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
+[![npm install](https://img.shields.io/badge/install-npm%20i%20%40misaelzapata%2Fnode--vmm-cb3837.svg?style=flat)](https://www.npmjs.com/package/@misaelzapata/node-vmm)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18.19-339933.svg?style=flat)](package.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
 [![Types](https://img.shields.io/badge/types-TypeScript-blue.svg?style=flat)](docs/sdk.md)
 [![ESM only](https://img.shields.io/badge/module-ESM%20only-4b32c3.svg?style=flat)](docs/sdk.md)
