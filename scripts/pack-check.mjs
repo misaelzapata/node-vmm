@@ -27,10 +27,13 @@ if (bad.length > 0) {
 for (const required of [
   "dist/src/index.js",
   "dist/src/index.d.ts",
+  "dist/src/main.js",
+  "prebuilds/linux-x64/node_vmm_native.node",
   "native/kvm_backend.cc",
   "native/whp_backend.cc",
   "guest/node-vmm-console.cc",
   "scripts/build-native.mjs",
+  "scripts/package-prebuild.mjs",
   "binding.gyp",
   "README.md",
   "LICENSE",

@@ -1,6 +1,6 @@
 {
   "name": "@misaelzapata/node-vmm",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A TypeScript/JavaScript SDK and CLI for running small hypervisor-backed microVMs from OCI images.",
   "type": "module",
   "license": "MIT",
@@ -76,10 +76,12 @@
   },
   "files": [
     "dist/src",
+    "prebuilds",
     "native",
     "guest",
     "docs",
     "scripts/build-native.mjs",
+    "scripts/package-prebuild.mjs",
     "binding.gyp",
     "README.md",
     "LICENSE"
@@ -88,9 +90,10 @@
     "build": "npm run build:native && npm run build:ts",
     "build:ts": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
     "build:native": "node scripts/build-native.mjs --required",
+    "build:prebuild": "npm run build:native && node scripts/package-prebuild.mjs",
     "build:native:coverage": "CXXFLAGS='--coverage -O0' LDFLAGS='--coverage' node-gyp rebuild",
     "install": "node scripts/build-native.mjs",
-    "prepack": "npm run build",
+    "prepack": "npm run build:prebuild && npm run build:ts",
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:unit": "npm run build && node --test dist/test/unit.test.js",
     "test:coverage": "npm run test:coverage:ts && npm run test:coverage:cpp",
@@ -107,7 +110,7 @@
     "kernel:fetch": "node scripts/fetch-kernel.mjs",
     "clean": "node scripts/clean.mjs",
     "release:check": "node scripts/release-check.mjs",
-    "pack:check": "npm run build && node scripts/pack-check.mjs",
+    "pack:check": "npm run build:prebuild && npm run build:ts && node scripts/pack-check.mjs",
     "doctor": "npm run build && node dist/src/main.js doctor",
     "start": "npm run build && node dist/src/main.js"
   },

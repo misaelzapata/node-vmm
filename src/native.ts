@@ -132,7 +132,10 @@ export type NativeBackend = NativeKvmBackend & NativeWhpBackend;
 
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
-const addonPath = path.resolve(here, "../../build/Release/node_vmm_native.node");
+const addonPaths = [
+  path.resolve(here, "../../prebuilds", `${process.platform}-${process.arch}`, "node_vmm_native.node"),
+  path.resolve(here, "../../build/Release/node_vmm_native.node"),
+];
 
 let loadedNative: Partial<NativeBackend> | undefined;
 
@@ -140,16 +143,28 @@ function loadNative(): Partial<NativeBackend> {
   if (loadedNative) {
     return loadedNative;
   }
-  try {
-    loadedNative = require(addonPath) as Partial<NativeBackend>;
-    return loadedNative;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    const hint = existsSync(addonPath)
-      ? ""
-      : " Run `npm run build:native` from the repository root, or reinstall the package with lifecycle scripts enabled.";
-    throw new NodeVmmError(`native backend unavailable for ${process.platform}/${process.arch}: ${reason}.${hint}`);
+  const failures: string[] = [];
+  for (const addonPath of addonPaths) {
+    if (!existsSync(addonPath)) {
+      continue;
+    }
+    try {
+      loadedNative = require(addonPath) as Partial<NativeBackend>;
+      return loadedNative;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push(`${addonPath}: ${reason}`);
+    }
   }
+  const hint =
+    failures.length > 0
+      ? " Rebuild with `NODE_VMM_FORCE_NATIVE_BUILD=1 npm rebuild @misaelzapata/node-vmm`."
+      : " Run `npm run build:native` from the repository root, or reinstall the package with lifecycle scripts enabled.";
+  throw new NodeVmmError(
+    `native backend unavailable for ${process.platform}/${process.arch}: tried ${addonPaths.join(", ")}${
+      failures.length > 0 ? `. Load failures: ${failures.join("; ")}` : ""
+    }.${hint}`,
+  );
 }
 
 function requireNativeMethod<K extends keyof NativeBackend>(name: K): NativeBackend[K] {

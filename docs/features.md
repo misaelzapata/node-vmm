@@ -24,7 +24,7 @@ work in progress.
 | Warm pool manager | Missing | Needs template cache, lease/recycle, health checks, and cleanup policy. |
 | Multi-vCPU runtime | Available | `--cpus` / `cpus` creates Linux/KVM vCPU threads and exposes them through ACPI/MP tables. |
 | Windows WHP runtime | In progress | Build/probe path exists; npm release should be treated as Linux/KVM today. |
-| Native prebuilts | Missing | Install currently builds with `node-gyp`; prebuilds are planned. |
+| Native prebuilts | Partial | Linux x64 npm installs include `prebuilds/linux-x64/node_vmm_native.node`; other targets fall back to `node-gyp`. |
 | Compose/multi-service apps | Missing | Single VM app/server workflow exists; stacks are not implemented yet. |
 | ARM64 backend | Missing | Current native backend and default kernel path target x86_64. |
 

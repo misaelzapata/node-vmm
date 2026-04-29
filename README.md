@@ -58,7 +58,7 @@ Pause/resume timings from real app servers:
 | Vite Vue | 25 ms | 3.31 s |
 | Next.js hello-world | 50 ms | 2.60 s |
 
-Prepared rootfs cache timings for `run --image` in the `0.1.1` release
+Prepared rootfs cache timings for `run --image` in the `0.1.2` release
 candidate:
 
 | Path | Image / command | Cache | Wall time |
@@ -164,7 +164,9 @@ Linux runtime:
 - Linux with `/dev/kvm`
 - KVM enabled in BIOS/UEFI and loaded by the host kernel
 - Node.js 18.19+
-- `python3`, `make`, and `g++` for `node-gyp`
+- Linux x64 npm installs use the bundled native prebuild by default
+- `python3`, `make`, and `g++` are only needed when forcing or falling back to a
+  local `node-gyp` build
 - `mkfs.ext4`, `mount`, `umount`, `truncate`, `install`
 - `ip`, `iptables`, `sysctl` for `network: "auto"` / `--net auto`
 - `git` for `--repo` / SDK repo builds
@@ -258,7 +260,8 @@ and decompressed kernel size.
 
 ## CLI
 
-Install it globally, run it with `npx`, or use the local project binary:
+The npm package exposes the `node-vmm` CLI through `package.json#bin`. Install it
+globally, run it with `npx`, or use the local project binary:
 
 ```bash
 npm install -g @misaelzapata/node-vmm
@@ -269,6 +272,11 @@ npx @misaelzapata/node-vmm kernel fetch
 npm install @misaelzapata/node-vmm
 npx @misaelzapata/node-vmm features
 ```
+
+On Linux x64 the package includes `prebuilds/linux-x64/node_vmm_native.node`, so
+normal installs do not compile the KVM addon. Set
+`NODE_VMM_FORCE_NATIVE_BUILD=1` before `npm rebuild @misaelzapata/node-vmm` if
+you want to rebuild it locally.
 
 ```bash
 sudo node-vmm doctor

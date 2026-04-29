@@ -1,7 +1,9 @@
 # Publishing
 
 The package publishes as `@misaelzapata/node-vmm` under MIT. It is ESM-only and
-compiles the native addon during installation with `node-gyp`.
+exposes the `node-vmm` CLI through `package.json#bin`. Linux x64 packages include
+a native KVM prebuild; unsupported or forced native builds fall back to
+`node-gyp`.
 
 ## Checklist
 
@@ -12,6 +14,7 @@ npm run test:e2e
 npm run test:consumers
 npm run test:js-apps
 sudo -n env PATH="$PATH" NODE_VMM_KERNEL="$NODE_VMM_KERNEL" npm run test:real-apps
+npm run build:prebuild
 npm run pack:check
 npm publish --dry-run --ignore-scripts --access public
 ```
@@ -36,9 +39,12 @@ npm publish --access public
 `files` is a whitelist. The tarball must include:
 
 - `dist/src`
+- `prebuilds/linux-x64/node_vmm_native.node`
 - `native/kvm_backend.cc`
 - `native/whp_backend.cc`
 - `guest/node-vmm-console.cc`
+- `scripts/build-native.mjs`
+- `scripts/package-prebuild.mjs`
 - `binding.gyp`
 - `README.md`
 - `LICENSE`
