@@ -29,7 +29,7 @@ import type {
   SdkSnapshotRestoreOptions,
 } from "./types.js";
 import type { KvmRunResult } from "./native.js";
-import { defaultKernelCmdline, probeKvm, probeWhp, runKvmVmAsync, runKvmVmControlled } from "./kvm.js";
+import { defaultKernelCmdline, hvfDefaultKernelCmdline, probeHvf, probeKvm, probeWhp, runHvfVm, runKvmVmAsync, runKvmVmControlled } from "./kvm.js";
 import {
   NodeVmmError,
   isWritableDirectory,
@@ -59,32 +59,42 @@ const DEFAULT_CACHE_DIR = path.join(os.tmpdir(), PRODUCT_NAME, "oci-cache");
 const ROOTFS_CACHE_VERSION = 1;
 const SNAPSHOT_MANIFEST = "snapshot.json";
 
-function hostBackend(): "kvm" | "whp" | "unsupported" {
+function hostBackend(): "kvm" | "whp" | "hvf" | "unsupported" {
   if (process.platform === "linux") {
     return "kvm";
   }
   if (process.platform === "win32") {
     return "whp";
   }
+  if (process.platform === "darwin") {
+    return "hvf";
+  }
   return "unsupported";
 }
 
 function featureLines(): string[] {
   const backend = hostBackend();
+  const archLabel =
+    backend === "whp" ? "windows/x86_64" :
+    backend === "hvf" ? "darwin/arm64" :
+    "linux/x86_64";
+  const kernelLabel =
+    backend === "hvf" ? "ARM64 Image (provide via --kernel or NODE_VMM_KERNEL)" :
+    "ELF vmlinux";
   return [
-  `backend: ${backend === "unsupported" ? "none" : backend}`,
-  `arch: ${backend === "whp" ? "windows/x86_64" : "linux/x86_64"}`,
-  "kernel: ELF vmlinux",
-  "vcpu: 1-64 on Linux/KVM; default 1",
-  "memory: configurable with --mem",
-  "disk: virtio-mmio block at /dev/vda",
-  "restore: core snapshots restore with a sparse copy-on-write disk overlay",
-  "rootfs: build from OCI image or boot prebuilt ext4 disk",
-  "console: UART COM1, batch or --interactive PTY helper",
-  "network: virtio-mmio net with TAP/NAT via --net auto",
-  "snapshot: native RAM and dirty-page primitives are exposed for backend release gates",
-  backend === "whp" ? "windows: WHP probe and native smoke are available in the Windows addon" : "windows: WHP backend builds on Windows",
-  "unsupported: bzImage, jailer",
+    `backend: ${backend === "unsupported" ? "none" : backend}`,
+    `arch: ${archLabel}`,
+    `kernel: ${kernelLabel}`,
+    backend === "hvf" ? "vcpu: 1-4 on macOS/HVF; default 1" : "vcpu: 1-64 on Linux/KVM; default 1",
+    "memory: configurable with --mem",
+    "disk: virtio-mmio block at /dev/vda",
+    "restore: core snapshots restore with a sparse copy-on-write disk overlay",
+    "rootfs: build from OCI image or boot prebuilt ext4 disk",
+    backend === "hvf" ? "console: PL011 UART, batch or --interactive" : "console: UART COM1, batch or --interactive PTY helper",
+    backend === "hvf" ? "network: virtio-mmio net via vmnet.framework (--net auto)" : "network: virtio-mmio net with TAP/NAT via --net auto",
+    "snapshot: native RAM and dirty-page primitives are exposed for backend release gates",
+    backend === "whp" ? "windows: WHP probe and native smoke are available in the Windows addon" : "windows: WHP backend builds on Windows",
+    "unsupported: bzImage, jailer",
   ];
 }
 
@@ -222,7 +232,8 @@ function kernelCmdline(
     .map((item) => item.trim())
     .filter(Boolean)
     .join(" ");
-  return [defaultKernelCmdline(), networkArg, commandArg, fastExitArg, extraBootArgs].filter(Boolean).join(" ");
+  const baseCmdline = hostBackend() === "hvf" ? hvfDefaultKernelCmdline() : defaultKernelCmdline();
+  return [baseCmdline, networkArg, commandArg, fastExitArg, extraBootArgs].filter(Boolean).join(" ");
 }
 
 async function readGuestCommandResult(rootfsPath: string): Promise<{ output: string; status?: number }> {
@@ -684,28 +695,30 @@ export async function runImage(
       defaults.logger?.(`${PRODUCT_NAME} console enabled; type \`exit\` or Ctrl-D to stop the guest`);
     }
 
-    const kvm = await runKvmVmAsync(
-      {
-        kernelPath: resolvePath(defaults.cwd, kernelPath),
-        rootfsPath,
-        overlayPath,
-        memMiB: memoryFromOptions(options),
-        cpus: cpusFromOptions(options),
-        cmdline: kernelCmdline(
-          options.cmdline,
-          options.bootArgs,
-          [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
-          commandBootArg(options.cmd),
-          fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
-        ),
-        timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
-        consoleLimit: options.consoleLimit,
-        interactive,
-        netTapName: network.tapName,
-        netGuestMac: network.guestMac,
-      },
-      { signal: options.signal },
-    );
+    const vmConfig = {
+      kernelPath: resolvePath(defaults.cwd, kernelPath),
+      rootfsPath,
+      overlayPath,
+      memMiB: memoryFromOptions(options),
+      cpus: cpusFromOptions(options),
+      cmdline: kernelCmdline(
+        options.cmdline,
+        options.bootArgs,
+        [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
+        commandBootArg(options.cmd),
+        fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
+      ),
+      timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
+      consoleLimit: options.consoleLimit,
+      interactive,
+      netTapName: network.tapName,
+      netGuestMac: network.guestMac,
+    };
+    const kvm = hostBackend() === "hvf"
+      ? await new Promise<import("./native.js").KvmRunResult>((resolve, reject) => {
+          try { resolve(runHvfVm(vmConfig)); } catch (e) { reject(e); }
+        })
+      : await runKvmVmAsync(vmConfig, { signal: options.signal });
     let guest = !interactive ? readGuestCommandResultFromConsole(kvm.console) : { output: "", status: undefined };
     if (!interactive && !overlayPath && guest.status === undefined && guest.output === "") {
       guest = await readGuestCommandResult(rootfsPath);
@@ -809,28 +822,41 @@ export async function startVm(
       );
     }
 
-    const nativeHandle = runKvmVmControlled(
-      {
-        kernelPath: resolvePath(defaults.cwd, kernelPath),
-        rootfsPath,
-        overlayPath,
-        memMiB: memoryFromOptions(options),
-        cpus: cpusFromOptions(options),
-        cmdline: kernelCmdline(
-          options.cmdline,
-          options.bootArgs,
-          [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
-          commandBootArg(options.cmd),
-          fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
-        ),
-        timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
-        consoleLimit: options.consoleLimit,
-        interactive,
-        netTapName: network.tapName,
-        netGuestMac: network.guestMac,
-      },
-      { signal: options.signal },
-    );
+    const startVmConfig = {
+      kernelPath: resolvePath(defaults.cwd, kernelPath),
+      rootfsPath,
+      overlayPath,
+      memMiB: memoryFromOptions(options),
+      cpus: cpusFromOptions(options),
+      cmdline: kernelCmdline(
+        options.cmdline,
+        options.bootArgs,
+        [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
+        commandBootArg(options.cmd),
+        fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
+      ),
+      timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
+      consoleLimit: options.consoleLimit,
+      interactive,
+      netTapName: network.tapName,
+      netGuestMac: network.guestMac,
+    };
+    // HVF does not support controlled pause/resume; wrap as a simple async handle
+    const nativeHandle = hostBackend() === "hvf"
+      ? (() => {
+          let state: import("./types.js").RunningVmState = "starting";
+          const running = new Promise<import("./native.js").KvmRunResult>((resolve, reject) => {
+            try { state = "running"; resolve(runHvfVm(startVmConfig)); } catch (e) { reject(e); }
+          }).finally(() => { state = "exited"; });
+          return {
+            state: () => state,
+            pause: async () => { /* not supported on HVF */ },
+            resume: async () => { /* not supported on HVF */ },
+            stop: async () => { state = "stopping"; return running; },
+            wait: () => running,
+          };
+        })()
+      : runKvmVmControlled(startVmConfig, { signal: options.signal });
 
     const waitResult = nativeHandle
       .wait()
@@ -1175,6 +1201,25 @@ export async function doctor(): Promise<DoctorResult> {
       });
     } catch (error) {
       checks.push({ name: "whp-api", ok: false, label: error instanceof Error ? error.message : String(error) });
+    }
+    return { ok: checks.every((check) => check.ok), checks };
+  }
+  if (hostBackend() === "hvf") {
+    checks.push({ name: "platform", ok: true, label: "macOS host (Apple Silicon)" });
+    try {
+      const probe = probeHvf();
+      checks.push({
+        name: "hvf-api",
+        ok: probe.available,
+        label: probe.available
+          ? "Hypervisor.framework ready"
+          : probe.reason || "Hypervisor.framework not available",
+      });
+    } catch (error) {
+      checks.push({ name: "hvf-api", ok: false, label: error instanceof Error ? error.message : String(error) });
+    }
+    for (const command of ["mkfs.ext4", "python3", "make", "g++"]) {
+      checks.push({ name: command, ok: await commandExists(command), label: `command ${command}` });
     }
     return { ok: checks.every((check) => check.ok), checks };
   }

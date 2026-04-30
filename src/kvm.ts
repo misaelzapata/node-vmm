@@ -1,6 +1,8 @@
 import { Worker } from "node:worker_threads";
 
 import type {
+  HvfProbeResult,
+  HvfRunConfig,
   KvmProbeResult,
   KvmRunConfig,
   KvmRunResult,
@@ -34,6 +36,30 @@ export function probeKvm(): KvmProbeResult {
 
 export function probeWhp(): WhpProbeResult {
   return native.probeWhp();
+}
+
+export function probeHvf(): HvfProbeResult {
+  return native.probeHvf();
+}
+
+export function runHvfVm(config: HvfRunConfig): KvmRunResult {
+  return native.runVm(config as Parameters<typeof native.runVm>[0]);
+}
+
+export function hvfDefaultKernelCmdline(): string {
+  return [
+    "console=ttyAMA0,115200",
+    "reboot=k",
+    "panic=1",
+    "nomodule",
+    "loglevel=4",
+    "root=/dev/vda",
+    "rootfstype=ext4",
+    "rootwait",
+    "rw",
+    "init=/init",
+    "virtio_mmio.device=0x200@0x0a000000:33",
+  ].join(" ");
 }
 
 export function smokeHlt(): KvmSmokeResult {

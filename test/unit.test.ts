@@ -611,19 +611,24 @@ test("parsePortForward follows Docker publish syntax for TCP ports", () => {
 });
 
 test("SDK exposes feature, doctor, and client helpers", async () => {
-  assert.ok(features().some((line) => line.includes("backend: kvm")));
+  const expectedBackend = process.platform === "linux" ? "kvm" : process.platform === "win32" ? "whp" : process.platform === "darwin" ? "hvf" : "none";
+  assert.ok(features().some((line) => line.includes(`backend: ${expectedBackend}`)));
   assert.equal(nodeVmm, nodeVmmDefault);
   assert.equal(snapshot, createSnapshot);
   assert.equal(restore, restoreSnapshot);
   assert.deepEqual(nodeVmmDefault.features(), features());
   const result = await doctor();
   assert.equal(typeof result.ok, "boolean");
-  assert.ok(result.checks.some((check) => check.name === "/dev/kvm"));
+  if (process.platform === "linux") {
+    assert.ok(result.checks.some((check) => check.name === "/dev/kvm"));
+  }
   const client: NodeVmmClient = createNodeVmmClient({ logger: () => undefined });
   const nodeClient: NodeVmmClient = createNodeVmmClient({ logger: () => undefined });
   assert.deepEqual(client.features(), features());
   assert.deepEqual(nodeClient.features(), features());
-  assert.ok(features().some((line) => line.includes("vcpu: 1-64")));
+  if (process.platform === "linux") {
+    assert.ok(features().some((line) => line.includes("vcpu: 1-64")));
+  }
   assert.equal(typeof client.run, "function");
   assert.equal(typeof client.runCode, "function");
   assert.equal(typeof client.boot, "function");
@@ -678,8 +683,10 @@ test("SDK validates missing options before doing expensive work", async () => {
   }
   await assert.rejects(() => prepareSandbox({ kernel: "vmlinux", net: "none" }), /prepare requires/);
   await assert.rejects(() => createSnapshot({ kernel: "vmlinux", output: "snapshot", net: "none" }), /snapshot create requires/);
-  assert.throws(() => ramSnapshotSmoke({ snapshotDir: "" }), /snapshotDir is required/);
-  assert.throws(() => dirtyRamSnapshotSmoke({ snapshotDir: "" }), /snapshotDir is required/);
+  if (process.platform === "linux") {
+    assert.throws(() => ramSnapshotSmoke({ snapshotDir: "" }), /snapshotDir is required/);
+    assert.throws(() => dirtyRamSnapshotSmoke({ snapshotDir: "" }), /snapshotDir is required/);
+  }
   assert.equal(build, buildRootfsImage);
   assert.equal(prepare, prepareSandbox);
   assert.equal(createSandbox, prepareSandbox);

@@ -91,6 +91,27 @@ export interface DirtyRamSnapshotSmokeResult {
   privateRamMapping: boolean;
 }
 
+export interface HvfProbeResult {
+  backend: "hvf";
+  arch: "arm64";
+  available: boolean;
+  reason?: string;
+}
+
+export interface HvfRunConfig {
+  kernelPath: string;
+  rootfsPath: string;
+  overlayPath?: string;
+  memMiB: number;
+  cpus?: number;
+  cmdline: string;
+  timeoutMs?: number;
+  consoleLimit?: number;
+  interactive?: boolean;
+  netTapName?: string;
+  netGuestMac?: string;
+}
+
 export interface KvmRunConfig {
   kernelPath: string;
   rootfsPath: string;
@@ -128,7 +149,12 @@ export interface NativeWhpBackend {
   whpSmokeHlt(): WhpSmokeResult;
 }
 
-export type NativeBackend = NativeKvmBackend & NativeWhpBackend;
+export interface NativeHvfBackend {
+  probeHvf(): HvfProbeResult;
+  runVm(config: HvfRunConfig): KvmRunResult;
+}
+
+export type NativeBackend = NativeKvmBackend & NativeWhpBackend & NativeHvfBackend;
 
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -179,6 +205,7 @@ function requireNativeMethod<K extends keyof NativeBackend>(name: K): NativeBack
 export const native: NativeBackend = {
   probeKvm: () => requireNativeMethod("probeKvm")(),
   probeWhp: () => requireNativeMethod("probeWhp")(),
+  probeHvf: () => requireNativeMethod("probeHvf")(),
   smokeHlt: () => requireNativeMethod("smokeHlt")(),
   whpSmokeHlt: () => requireNativeMethod("whpSmokeHlt")(),
   uartSmoke: () => requireNativeMethod("uartSmoke")(),

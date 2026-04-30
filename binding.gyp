@@ -32,6 +32,32 @@
               "AdditionalOptions": ["/guard:cf", "/DYNAMICBASE", "/NXCOMPAT"]
             }
           }
+        }],
+        ["OS=='mac'", {
+          "sources": ["native/hvf_backend.cc"],
+          "cflags_cc!": ["-fno-exceptions"],
+          "cflags_cc": [
+            "-std=c++17",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Wno-missing-field-initializers",
+            "-fexceptions"
+          ],
+          "xcode_settings": {
+            "OTHER_CFLAGS": [
+              "-mmacosx-version-min=15.0",
+              "-std=c++17",
+              "-fexceptions",
+              "-O2"
+            ],
+            "MACOSX_DEPLOYMENT_TARGET": "15.0",
+            "OTHER_LDFLAGS": [
+              "-framework Hypervisor",
+              "-framework vmnet",
+              "-framework CoreFoundation"
+            ]
+          }
         }]
       ]
     }

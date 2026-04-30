@@ -6,7 +6,8 @@ const required = process.argv.includes("--required") || process.env.NODE_VMM_NAT
 const force = process.env.NODE_VMM_FORCE_NATIVE_BUILD === "1";
 const supported =
   (process.platform === "linux" && process.arch === "x64") ||
-  (process.platform === "win32" && process.arch === "x64");
+  (process.platform === "win32" && process.arch === "x64") ||
+  (process.platform === "darwin" && process.arch === "arm64");
 
 if (process.env.NODE_VMM_SKIP_NATIVE === "1") {
   process.stdout.write("node-vmm native build skipped by NODE_VMM_SKIP_NATIVE=1\n");

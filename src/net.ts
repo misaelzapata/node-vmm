@@ -197,6 +197,18 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
     throw new NodeVmmError(`unsupported network mode: ${mode}`);
   }
 
+  // macOS: use vmnet.framework (no ip/iptables needed; HVF backend handles it)
+  if (process.platform === "darwin") {
+    return {
+      mode: "tap",
+      tapName: "vmnet:shared",
+      guestMac: deterministicMac(options.id),
+      // kernelNetArgs tells the guest kernel to use DHCP (vmnet provides DHCP)
+      kernelNetArgs: "ip=dhcp",
+      cleanup: async () => { /* vmnet lifecycle managed in native backend */ },
+    };
+  }
+
   requireRoot("--net auto");
   await requireCommands(["ip", "sysctl", "iptables"]);
 
