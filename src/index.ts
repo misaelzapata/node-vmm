@@ -1,15 +1,26 @@
 import { createHash } from "node:crypto";
-import { copyFile, link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { setupNetwork } from "./net.js";
 import { requireKernelPath } from "./kernel.js";
 import { commandExists, runCommand } from "./process.js";
+import {
+  ensureDiskSizeAtLeast,
+  materializeExplicitDisk,
+  materializePersistentDisk,
+  resolveAttachedDisks,
+  validateAttachedDiskPaths,
+} from "./disk.js";
+import { prebuiltSlugForImage, readPackageVersion, tryFetchPrebuiltRootfs } from "./prebuilt-rootfs.js";
 import { buildRootfs } from "./rootfs.js";
 import type {
   DoctorCheck,
   DoctorResult,
+  HostBackend,
+  HostCapabilities,
+  HostPlatformInfo,
   NodeVmmClient,
   NodeVmmClientOptions,
   NetworkConfig,
@@ -27,9 +38,18 @@ import type {
   SdkSnapshotCreateOptions,
   SdkSnapshotManifest,
   SdkSnapshotRestoreOptions,
+  ResolvedAttachedDisk,
 } from "./types.js";
-import type { KvmRunResult } from "./native.js";
-import { defaultKernelCmdline, probeKvm, probeWhp, runKvmVmAsync, runKvmVmControlled } from "./kvm.js";
+import { native, type KvmRunResult } from "./native.js";
+import {
+  defaultKernelCmdline,
+  probeKvm,
+  probeWhp,
+  runKvmVmAsync,
+  runKvmVmControlled,
+  virtioExtraBlkKernelArgs,
+  virtioNetKernelArg,
+} from "./kvm.js";
 import {
   NodeVmmError,
   isWritableDirectory,
@@ -42,6 +62,7 @@ import {
 } from "./utils.js";
 
 export * from "./args.js";
+export * from "./disk.js";
 export * from "./kernel.js";
 export * from "./kvm.js";
 export * from "./native.js";
@@ -52,39 +73,163 @@ export * from "./rootfs.js";
 export * from "./types.js";
 export * from "./utils.js";
 
+// Internal-only namespace export — the ext4 writer is a scaffold (Track
+// D.2.b, follow-up to D.2.a prebuilt rootfs downloads). All public
+// methods throw NotImplementedError until the writer ships. Not part of
+// the stable SDK surface.
+export * as ext4 from "./ext4/index.js";
+
 export const VERSION = "0.1.3";
 
 const PRODUCT_NAME = "node-vmm";
 const DEFAULT_CACHE_DIR = path.join(os.tmpdir(), PRODUCT_NAME, "oci-cache");
-const ROOTFS_CACHE_VERSION = 1;
+const ROOTFS_CACHE_VERSION = 35;
 const SNAPSHOT_MANIFEST = "snapshot.json";
+const WINDOWS_ROOTFS_BUILD_ERROR =
+  "Windows/WHP can build OCI image rootfs images through WSL2. Dockerfile and repo builds still require Linux for now; pass rootfsPath/diskPath to an existing ext4 image or build from an OCI image with WSL2 installed.";
 
-function hostBackend(): "kvm" | "whp" | "unsupported" {
-  if (process.platform === "linux") {
+export function hostBackendForHost(host: Partial<HostPlatformInfo> = {}): HostBackend {
+  const platform = host.platform ?? process.platform;
+  const arch = host.arch ?? process.arch;
+  if (platform === "linux" && arch === "x64") {
     return "kvm";
   }
-  if (process.platform === "win32") {
+  if (platform === "win32" && arch === "x64") {
     return "whp";
   }
   return "unsupported";
 }
 
-function featureLines(): string[] {
-  const backend = hostBackend();
+function hostArchLine(backend: HostBackend, host: HostPlatformInfo): string {
+  if (backend === "kvm") {
+    return "linux/x86_64";
+  }
+  if (backend === "whp") {
+    return "windows/x86_64";
+  }
+  return `${host.platform}/${host.arch}`;
+}
+
+export function capabilitiesForHost(host: Partial<HostPlatformInfo> = {}): HostCapabilities {
+  const resolved = {
+    platform: host.platform ?? process.platform,
+    arch: host.arch ?? process.arch,
+  };
+  const backend = hostBackendForHost(resolved);
+  if (backend === "kvm") {
+    return {
+      backend,
+      platform: resolved.platform,
+      arch: resolved.arch,
+      archLine: hostArchLine(backend, resolved),
+      vmRuntime: true,
+      rootfsBuild: true,
+      prebuiltRootfs: true,
+      defaultNetwork: "auto",
+      networkModes: ["auto", "none", "tap"],
+      tapNetwork: true,
+      portForwarding: true,
+      minCpus: 1,
+      maxCpus: 64,
+      rootfsMaxCpus: 64,
+    };
+  }
+  if (backend === "whp") {
+    return {
+      backend,
+      platform: resolved.platform,
+      arch: resolved.arch,
+      archLine: hostArchLine(backend, resolved),
+      vmRuntime: true,
+      rootfsBuild: true,
+      prebuiltRootfs: true,
+      // Mirror the Linux/KVM surface: defaultNetwork is "auto" so that the
+      // same `node-vmm run --net auto` works cross-platform. On WHP, "auto"
+      // resolves to libslirp user-mode networking (10.0.2.0/24 NAT), which
+      // is the closest analogue to KVM's TAP+iptables auto setup.
+      defaultNetwork: "auto",
+      networkModes: ["auto", "none", "slirp"],
+      tapNetwork: false,
+      portForwarding: true,
+      minCpus: 1,
+      maxCpus: 64,
+      rootfsMaxCpus: 64,
+    };
+  }
+  return {
+    backend,
+    platform: resolved.platform,
+    arch: resolved.arch,
+    archLine: hostArchLine(backend, resolved),
+    vmRuntime: false,
+    rootfsBuild: false,
+    prebuiltRootfs: false,
+    defaultNetwork: "none",
+    networkModes: ["none"],
+    tapNetwork: false,
+    portForwarding: false,
+    minCpus: 1,
+    maxCpus: 1,
+    rootfsMaxCpus: 1,
+  };
+}
+
+function hostCapabilities(): HostCapabilities {
+  return capabilitiesForHost();
+}
+
+function assertVmRuntimeAvailable(capabilities = hostCapabilities()): void {
+  if (capabilities.backend === "kvm") {
+    probeKvm();
+    return;
+  }
+  if (capabilities.backend === "whp") {
+    const probe = probeWhp();
+    if (!probe.available) {
+      throw new NodeVmmError(probe.reason || "Windows Hypervisor Platform is not available");
+    }
+    return;
+  }
+  throw new NodeVmmError(`node-vmm VM execution is not supported on ${capabilities.platform}/${capabilities.arch}`);
+}
+
+function featureLines(capabilities = hostCapabilities()): string[] {
+  const backend = capabilities.backend;
+  if (backend === "unsupported") {
+    return [
+      "backend: none",
+      `arch: ${capabilities.archLine}`,
+      "vm: unsupported on this host",
+      "vcpu: unsupported on this host",
+      "rootfs: prebuilt ext4 boot/build not available through node-vmm on this host",
+      "network: none",
+      "unsupported: Linux x64 KVM and Windows x64 WHP are the supported host backends",
+    ];
+  }
   return [
-  `backend: ${backend === "unsupported" ? "none" : backend}`,
-  `arch: ${backend === "whp" ? "windows/x86_64" : "linux/x86_64"}`,
-  "kernel: ELF vmlinux",
-  "vcpu: 1-64 on Linux/KVM; default 1",
-  "memory: configurable with --mem",
-  "disk: virtio-mmio block at /dev/vda",
-  "restore: core snapshots restore with a sparse copy-on-write disk overlay",
-  "rootfs: build from OCI image or boot prebuilt ext4 disk",
-  "console: UART COM1, batch or --interactive PTY helper",
-  "network: virtio-mmio net with TAP/NAT via --net auto",
-  "snapshot: native RAM and dirty-page primitives are exposed for backend release gates",
-  backend === "whp" ? "windows: WHP probe and native smoke are available in the Windows addon" : "windows: WHP backend builds on Windows",
-  "unsupported: bzImage, jailer",
+    `backend: ${backend}`,
+    `arch: ${capabilities.archLine}`,
+    "kernel: ELF vmlinux",
+    backend === "whp"
+      ? "vcpu: 1-64 on Windows/WHP; rootfs-backed Alpine SMP is covered by WHP tests"
+      : "vcpu: 1-64 on Linux/KVM; default 1",
+    "memory: configurable with --mem",
+    "disk: virtio-mmio root block at /dev/vda; attached data disks start at /dev/vdb",
+    "restore: core snapshots restore with a sparse copy-on-write disk overlay",
+    backend === "whp"
+      ? "rootfs: build OCI images through WSL2 or boot prebuilt ext4 disk; Dockerfile/repo builds require Linux for now"
+      : "rootfs: build from OCI image, Dockerfile, repo, or boot prebuilt ext4 disk",
+    "console: UART COM1, batch or --interactive PTY helper",
+    capabilities.portForwarding
+      ? backend === "whp"
+        ? "network: virtio-mmio net with libslirp via --net auto/--net slirp; TCP publish supported"
+        : "network: virtio-mmio net with TAP/NAT via --net auto; TCP publish supported"
+      : "network: none by default; WHP networking, TAP, and TCP publish are not available yet",
+    backend === "whp"
+      ? "snapshot: rootfs snapshot bundles and WHP dirty-page probes; RAM/device restore still pending"
+      : "snapshot: native RAM and dirty-page primitives are exposed for backend release gates",
+    backend === "whp" ? "windows: WHP backend selected for VM execution" : "windows: WHP backend builds on Windows",
+    "unsupported: bzImage, jailer",
   ];
 }
 
@@ -92,8 +237,22 @@ function resolvePath(cwd: string, target: string): string {
   return path.isAbsolute(target) ? target : path.resolve(cwd, target);
 }
 
-function defaultNetwork(mode: NetworkMode | undefined, tapName?: string): NetworkMode {
-  return mode || (tapName ? "tap" : "auto");
+export function defaultNetworkForCapabilities(
+  capabilities: HostCapabilities,
+  mode: NetworkMode | undefined,
+  tapName?: string,
+): NetworkMode {
+  if (mode) {
+    return mode;
+  }
+  if (capabilities.defaultNetwork === "auto" && tapName) {
+    return "tap";
+  }
+  return capabilities.defaultNetwork;
+}
+
+function defaultNetwork(mode: NetworkMode | undefined, tapName?: string, capabilities = hostCapabilities()): NetworkMode {
+  return defaultNetworkForCapabilities(capabilities, mode, tapName);
 }
 
 function sameValue<T>(a: T | undefined, b: T | undefined): boolean {
@@ -106,9 +265,12 @@ function requireNoAliasConflict<T>(label: string, a: T | undefined, b: T | undef
   }
 }
 
-function networkFromOptions(options: { net?: NetworkMode; network?: NetworkMode; tapName?: string }): NetworkMode {
+function networkFromOptions(
+  options: { net?: NetworkMode; network?: NetworkMode; tapName?: string },
+  capabilities = hostCapabilities(),
+): NetworkMode {
   requireNoAliasConflict("net/network", options.net, options.network);
-  return defaultNetwork(options.network ?? options.net, options.tapName);
+  return defaultNetwork(options.network ?? options.net, options.tapName, capabilities);
 }
 
 async function kernelPathFromOptions(
@@ -127,10 +289,13 @@ function memoryFromOptions(options: { memory?: number; memMiB?: number }): numbe
   return options.memMiB ?? options.memory ?? 256;
 }
 
-function cpusFromOptions(options: { cpus?: number }): number {
+function cpusFromOptions(options: { cpus?: number }, capabilities = hostCapabilities()): number {
   const cpus = options.cpus ?? 1;
   if (!Number.isInteger(cpus) || cpus < 1 || cpus > 64) {
     throw new NodeVmmError("cpus must be an integer between 1 and 64");
+  }
+  if (cpus > capabilities.maxCpus) {
+    throw new NodeVmmError(`cpus must be an integer between ${capabilities.minCpus} and ${capabilities.maxCpus}`);
   }
   return cpus;
 }
@@ -140,17 +305,140 @@ function restoreEnabled(options: { restore?: boolean; sandbox?: boolean; overlay
   return options.restore === true || options.sandbox === true || Boolean(options.overlayPath);
 }
 
-function diskMiBFromOptions(options: { disk?: number; diskMiB?: number }, fallback: number): number {
+function diskMiBFromOptions(options: { disk?: number; diskMiB?: number; diskSizeMiB?: number }, fallback: number): number {
   requireNoAliasConflict("disk/diskMiB", options.disk, options.diskMiB);
-  return options.diskMiB ?? options.disk ?? fallback;
+  requireNoAliasConflict("disk/diskSizeMiB", options.disk, options.diskSizeMiB);
+  requireNoAliasConflict("diskMiB/diskSizeMiB", options.diskMiB, options.diskSizeMiB);
+  return options.diskSizeMiB ?? options.diskMiB ?? options.disk ?? fallback;
 }
 
-function validateVmOptions(options: { cpus?: number; net?: NetworkMode; network?: NetworkMode; tapName?: string }): void {
-  const network = networkFromOptions(options);
-  if (!["auto", "none", "tap"].includes(network)) {
-    throw new NodeVmmError("net must be auto, none, or tap");
+function unsupportedNetworkError(capabilities: HostCapabilities, feature: string, network?: NetworkMode): NodeVmmError {
+  if (capabilities.backend === "whp") {
+    if (feature === "tap") {
+      return new NodeVmmError("Windows/WHP does not support TAP networking yet; remove tapName/--tap and use network: 'none'");
+    }
+    if (feature === "ports") {
+      return new NodeVmmError("Windows/WHP does not support TCP port publishing yet; remove ports/--publish and use network: 'none'");
+    }
+    return new NodeVmmError(
+      `Windows/WHP does not support network:${network} yet; use network: 'none' until WHP networking is available`,
+    );
   }
-  cpusFromOptions(options);
+  return new NodeVmmError(`node-vmm networking is not supported on ${capabilities.platform}/${capabilities.arch}`);
+}
+
+export function validateVmOptionsForCapabilities(
+  options: {
+    cpus?: number;
+    net?: NetworkMode;
+    network?: NetworkMode;
+    tapName?: string;
+    ports?: PortForwardInput[];
+    attachDisks?: { path: string; readonly?: boolean }[];
+  },
+  capabilities = hostCapabilities(),
+): void {
+  const network = networkFromOptions(options, capabilities);
+  if (!["auto", "none", "tap", "slirp"].includes(network)) {
+    throw new NodeVmmError("net must be auto, none, tap, or slirp");
+  }
+  cpusFromOptions(options, capabilities);
+  if (options.tapName && !capabilities.tapNetwork) {
+    throw unsupportedNetworkError(capabilities, "tap");
+  }
+  if (!capabilities.networkModes.includes(network)) {
+    throw unsupportedNetworkError(capabilities, "network", network);
+  }
+  if ((options.ports?.length ?? 0) > 0 && !capabilities.portForwarding) {
+    throw unsupportedNetworkError(capabilities, "ports");
+  }
+  resolveAttachedDisks(process.cwd(), options.attachDisks);
+}
+
+function validateVmOptions(
+  options: {
+    cpus?: number;
+    net?: NetworkMode;
+    network?: NetworkMode;
+    tapName?: string;
+    ports?: PortForwardInput[];
+    attachDisks?: { path: string; readonly?: boolean }[];
+  },
+  capabilities = hostCapabilities(),
+): void {
+  validateVmOptionsForCapabilities(options, capabilities);
+}
+
+export function validateRootfsRuntimeForCapabilities(
+  operation: string,
+  options: { cpus?: number },
+  capabilities = hostCapabilities(),
+): void {
+  const cpus = cpusFromOptions(options, capabilities);
+  if (cpus > capabilities.rootfsMaxCpus) {
+    if (capabilities.backend === "whp") {
+      throw new NodeVmmError(
+        `${operation} cannot run rootfs-backed Linux with cpus=${cpus} on Windows/WHP. ` +
+          `This build currently supports up to ${capabilities.rootfsMaxCpus} vCPUs for rootfs-backed Linux guests.`,
+      );
+    }
+    throw new NodeVmmError(`cpus must be an integer between ${capabilities.minCpus} and ${capabilities.rootfsMaxCpus}`);
+  }
+}
+
+async function validateRootfsRuntimePathForCapabilities(
+  operation: string,
+  options: { cpus?: number },
+  rootfsPath: string,
+  capabilities = hostCapabilities(),
+): Promise<void> {
+  const cpus = cpusFromOptions(options, capabilities);
+  if (cpus <= capabilities.rootfsMaxCpus) {
+    return;
+  }
+  const info = await stat(rootfsPath);
+  if (info.size > 0) {
+    validateRootfsRuntimeForCapabilities(operation, options, capabilities);
+  }
+}
+
+function hasRootfsBuildInput(options: { image?: string; dockerfile?: string; repo?: string }): boolean {
+  return Boolean(options.image || options.dockerfile || options.repo);
+}
+
+function assertRootfsInput(
+  operation: string,
+  options: { rootfsPath?: string; diskPath?: string; image?: string; dockerfile?: string; repo?: string },
+): void {
+  if (!options.rootfsPath && !options.diskPath && !hasRootfsBuildInput(options)) {
+    throw new NodeVmmError(`${operation} requires rootfsPath, diskPath, image, dockerfile, or repo`);
+  }
+}
+
+export function validateRootfsOptionsForCapabilities(
+  operation: string,
+  options: { rootfsPath?: string; diskPath?: string; image?: string; dockerfile?: string; repo?: string },
+  capabilities = hostCapabilities(),
+): void {
+  assertRootfsInput(operation, options);
+  assertRootfsBuildSupportedForCapabilities(operation, options, capabilities);
+}
+
+export function assertRootfsBuildSupportedForCapabilities(
+  operation: string,
+  options: { rootfsPath?: string; diskPath?: string; image?: string; dockerfile?: string; repo?: string },
+  capabilities = hostCapabilities(),
+): void {
+  if (!options.rootfsPath && !options.diskPath && hasRootfsBuildInput(options) && capabilities.backend === "whp" && (options.dockerfile || options.repo)) {
+    throw new NodeVmmError(`${operation} cannot build this rootfs on Windows/WHP. ${WINDOWS_ROOTFS_BUILD_ERROR}`);
+  }
+  if (!options.rootfsPath && !options.diskPath && hasRootfsBuildInput(options) && !capabilities.rootfsBuild) {
+    const reason =
+      capabilities.backend === "whp"
+        ? WINDOWS_ROOTFS_BUILD_ERROR
+        : `node-vmm cannot build rootfs images on unsupported host ${capabilities.platform}/${capabilities.arch}`;
+    throw new NodeVmmError(`${operation} cannot build a rootfs on this host. ${reason}`);
+  }
 }
 
 async function cleanupBestEffort(steps: Array<(() => Promise<void>) | undefined>): Promise<void> {
@@ -192,6 +480,97 @@ function fastExitBootArg(enabled: boolean): string | undefined {
   return enabled ? "node_vmm.fast_exit=1" : undefined;
 }
 
+function resizeRootfsBootArg(enabled: boolean): string | undefined {
+  return enabled ? "node_vmm.resize_rootfs=1" : undefined;
+}
+
+function interactiveBootArg(enabled: boolean): string | undefined {
+  return enabled ? "node_vmm.interactive=1" : undefined;
+}
+
+function windowsConsoleBootArg(enabled: boolean): string | undefined {
+  return enabled ? "node_vmm.windows_console=1" : undefined;
+}
+
+function windowsConsoleRouteBootArg(enabled: boolean): string | undefined {
+  if (!enabled) {
+    return undefined;
+  }
+  const route = process.env.NODE_VMM_WHP_CONSOLE_ROUTE;
+  if (route !== "getty" && route !== "pty") {
+    return undefined;
+  }
+  return `node_vmm.console_route=${route}`;
+}
+
+function windowsConsoleSizeBootArg(enabled: boolean): string | undefined {
+  if (!enabled) {
+    return undefined;
+  }
+  const envCols = Number.parseInt(process.env.NODE_VMM_WHP_TTY_COLS || "", 10);
+  const envRows = Number.parseInt(process.env.NODE_VMM_WHP_TTY_ROWS || "", 10);
+  const ttySizeMode = process.env.NODE_VMM_WHP_TTY_SIZE || "qemu";
+  let cols = Number.isInteger(envCols) && envCols >= 20 ? envCols : 0;
+  let rows = Number.isInteger(envRows) && envRows >= 10 ? envRows : 0;
+
+  if ((cols === 0 || rows === 0) && ttySizeMode === "host") {
+    // Host-size mode is diagnostic: copy the visible Windows console size,
+    // then leave a small right-edge guard for ConPTY/VS Code.
+    try {
+      const sz = native.whpHostConsoleSize?.();
+      if (sz && sz.cols > 0 && sz.rows > 0) {
+        if (cols === 0) cols = sz.cols;
+        if (rows === 0) rows = sz.rows;
+      }
+    } catch {
+      // native not loaded yet (e.g. on Linux); fall through to stdio.
+    }
+    if (cols === 0 && Number.isInteger(process.stdout.columns) && process.stdout.columns > 0) {
+      cols = process.stdout.columns;
+    }
+    if (rows === 0 && Number.isInteger(process.stdout.rows) && process.stdout.rows > 0) {
+      rows = process.stdout.rows;
+    }
+    if (!Number.isInteger(envCols) && cols > 0) {
+      const guard = Number.parseInt(process.env.NODE_VMM_WHP_TTY_COL_GUARD || "2", 10);
+      cols = Math.max(20, cols - (Number.isInteger(guard) && guard >= 0 ? guard : 2));
+    }
+  }
+
+  // QEMU's stdio serial path does not propagate host terminal geometry to
+  // the guest. Keeping WHP at classic serial geometry by default avoids
+  // right-edge wrap artifacts in VS Code/ConPTY. Set
+  // NODE_VMM_WHP_TTY_SIZE=host to opt into host-sized serial geometry.
+  if (cols === 0) cols = 80;
+  if (rows === 0) rows = 24;
+  return `node_vmm.tty_cols=${cols} node_vmm.tty_rows=${rows}`;
+}
+
+function backendBootArgs(capabilities: HostCapabilities, interactive: boolean): {
+  backend: HostBackend;
+  interactiveArg?: string;
+  windowsConsoleArg?: string;
+  windowsConsoleRouteArg?: string;
+  windowsConsoleSizeArg?: string;
+} {
+  const windowsConsole = capabilities.backend === "whp" && interactive;
+  return {
+    backend: capabilities.backend,
+    interactiveArg: interactiveBootArg(interactive),
+    windowsConsoleArg: windowsConsoleBootArg(windowsConsole),
+    windowsConsoleRouteArg: windowsConsoleRouteBootArg(windowsConsole),
+    windowsConsoleSizeArg: windowsConsoleSizeBootArg(windowsConsole),
+  };
+}
+
+function defaultKernelCmdlineForBackend(backend: string): string {
+  const args = defaultKernelCmdline().split(/\s+/).filter(Boolean);
+  if (backend === "whp") {
+    return [...args.filter((arg) => arg !== "noapictimer"), "clocksource=refined-jiffies"].join(" ");
+  }
+  return args.join(" ");
+}
+
 function commandForCode(options: SdkRunCodeOptions): string {
   const language = options.language ?? "javascript";
   if (language === "javascript") {
@@ -211,21 +590,50 @@ function kernelCmdline(
   cmdline: string | undefined,
   bootArgs: string | undefined,
   networkArg?: string,
+  storageArg?: string,
   commandArg?: string,
   fastExitArg?: string,
+  resizeRootfsArg?: string,
+  interactiveArg?: string,
+  windowsConsoleArg?: string,
+  windowsConsoleRouteArg?: string,
+  windowsConsoleSizeArg?: string,
+  backend = "kvm",
 ): string {
+  // Even when the user passes a full --cmdline override, the node_vmm.*
+  // helper args (interactive flag, base64 command, fast-exit, network)
+  // must survive: the in-guest /init parser keys off them to pick the
+  // batch vs interactive run-block, decode the command, set up network.
+  // Dropping them silently lands the guest in batch mode with stdin
+  // closed -- which is exactly the symptom the user reported.
+  const append = [
+    networkArg,
+    storageArg,
+    commandArg,
+    fastExitArg,
+    resizeRootfsArg,
+    interactiveArg,
+    windowsConsoleArg,
+    windowsConsoleRouteArg,
+    windowsConsoleSizeArg,
+  ].filter(Boolean) as string[];
   if (cmdline) {
-    return cmdline;
+    return [cmdline, ...append].join(" ");
   }
   const extraBootArgs = (bootArgs || "")
     .split(/\s+/)
     .map((item) => item.trim())
     .filter(Boolean)
     .join(" ");
-  return [defaultKernelCmdline(), networkArg, commandArg, fastExitArg, extraBootArgs].filter(Boolean).join(" ");
+  return [defaultKernelCmdlineForBackend(backend), ...append, extraBootArgs]
+    .filter(Boolean)
+    .join(" ");
 }
 
 async function readGuestCommandResult(rootfsPath: string): Promise<{ output: string; status?: number }> {
+  if (process.platform === "win32") {
+    return { output: "", status: undefined };
+  }
   const mountDir = await makeTempDir(`${PRODUCT_NAME}-result-`);
   let mounted = false;
   try {
@@ -294,9 +702,9 @@ async function setupVmNetwork(options: {
 }
 
 function assertInteractiveTty(interactive: boolean, label: string): void {
-  if (interactive && !process.stdin.isTTY) {
+  if (interactive && !process.stdin.isTTY && process.env.NODE_VMM_ALLOW_NONTTY_INTERACTIVE !== "1") {
     throw new NodeVmmError(
-      `${label} requires a TTY stdin; run from a real terminal or use script(1) for automation`,
+      `${label} requires a TTY stdin; run from a real terminal or use script(1) for automation (set NODE_VMM_ALLOW_NONTTY_INTERACTIVE=1 to bypass)`,
     );
   }
 }
@@ -305,6 +713,7 @@ function createResult(params: {
   id: string;
   rootfsPath: string;
   overlayPath?: string;
+  attachedDisks?: ResolvedAttachedDisk[];
   restored: boolean;
   builtRootfs: boolean;
   network: NetworkConfig;
@@ -317,6 +726,7 @@ function createResult(params: {
     id: params.id,
     rootfsPath: params.rootfsPath,
     overlayPath: params.overlayPath,
+    attachedDisks: params.attachedDisks ?? [],
     restored: params.restored,
     builtRootfs: params.builtRootfs,
     network: params.network,
@@ -369,7 +779,14 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function rootfsCacheKey(options: SdkRunOptions | SdkPrepareOptions): string {
+// Exported for regression tests that assert WSL2 is not invoked on cache
+// hits; the cache lookup is the contract that buildOrReuseRootfs is built
+// around. Not part of the public SDK surface.
+/** @internal */
+export function rootfsCacheKey(options: SdkRunOptions | SdkPrepareOptions): string {
+  // initMode is intentionally NOT in the key: the rootfs ships both batch
+  // and interactive run-blocks and selects between them at boot time via
+  // node_vmm.interactive=... on the kernel cmdline.
   return createHash("sha256")
     .update(
       stableJson({
@@ -380,7 +797,6 @@ function rootfsCacheKey(options: SdkRunOptions | SdkPrepareOptions): string {
         env: options.env ?? {},
         entrypoint: options.entrypoint,
         workdir: options.workdir,
-        initMode: options.initMode,
         platformArch: options.platformArch,
         dockerfileRunTimeoutMs: options.dockerfileRunTimeoutMs,
       }),
@@ -399,14 +815,15 @@ function isCacheableOciRootfs(options: SdkRunOptions | SdkPrepareOptions, source
   );
 }
 
-async function buildOrReuseRootfs(params: {
+/** @internal */
+export async function buildOrReuseRootfs(params: {
   options: SdkRunOptions | SdkPrepareOptions;
   source: { contextDir: string; dockerfile?: string };
   output: string;
   tempDir: string;
   cacheDir: string;
   logger?: (message: string) => void;
-}): Promise<{ rootfsPath: string; fromCache: boolean; built: boolean }> {
+}): Promise<{ rootfsPath: string; fromCache: boolean; built: boolean; resizeRootfs: boolean }> {
   const cacheable = isCacheableOciRootfs(params.options, params.source);
   const buildOptions = {
     image: params.options.image,
@@ -425,10 +842,13 @@ async function buildOrReuseRootfs(params: {
     dockerfileRunTimeoutMs: params.options.dockerfileRunTimeoutMs,
     signal: params.options.signal,
   };
+  if (params.options.prebuilt === "require" && !cacheable) {
+    throw new NodeVmmError("required prebuilt rootfs unavailable for this rootfs input");
+  }
 
   if (!cacheable) {
     await buildRootfs({ ...buildOptions, output: params.output });
-    return { rootfsPath: params.output, fromCache: false, built: true };
+    return { rootfsPath: params.output, fromCache: false, built: true, resizeRootfs: false };
   }
 
   const rootfsCacheDir = path.join(params.cacheDir, "rootfs");
@@ -437,20 +857,188 @@ async function buildOrReuseRootfs(params: {
   const cached = path.join(rootfsCacheDir, `${key}.ext4`);
   if (await pathExists(cached)) {
     params.logger?.(`${PRODUCT_NAME} rootfs cache hit: ${cached}`);
-    return { rootfsPath: cached, fromCache: true, built: false };
+    return { rootfsPath: cached, fromCache: true, built: false, resizeRootfs: true };
   }
 
   params.logger?.(`${PRODUCT_NAME} rootfs cache miss: ${params.options.image}`);
   const tmp = path.join(rootfsCacheDir, `${key}.tmp-${process.pid}-${randomId("rootfs")}.ext4`);
+
+  // Track D.2.a: before falling back to the WSL2 build path, try
+  // fetching a prebuilt rootfs from the GitHub release for the current
+  // package version. Only attempts a download for the small set of
+  // images we publish (alpine:3.20, node:20-alpine, node:22-alpine);
+  // skips silently otherwise. On Windows this lets `run --image
+  // alpine:3.20` complete without any WSL2 spawn at all.
+  const image = params.options.image;
+  const prebuiltMode = params.options.prebuilt ?? "auto";
+  const prebuiltSlug = image ? prebuiltSlugForImage(image) : null;
+  if (prebuiltMode === "require" && !prebuiltSlug) {
+    throw new NodeVmmError(`no prebuilt rootfs is published for ${image ?? "this rootfs input"}`);
+  }
+  if (image && prebuiltSlug && prebuiltMode !== "off") {
+    const version = await readPackageVersion();
+    if (!version && prebuiltMode === "require") {
+      throw new NodeVmmError("cannot determine package version for required prebuilt rootfs download");
+    }
+    if (version) {
+      const fetched = await tryFetchPrebuiltRootfs({
+        image,
+        destPath: tmp,
+        packageVersion: version,
+        signal: params.options.signal,
+        logger: params.logger,
+      });
+      if (fetched.fetched) {
+        try {
+          const resizeRootfs = await ensureDiskSizeAtLeast(tmp, buildOptions.diskMiB);
+          await rename(tmp, cached);
+          params.logger?.(`${PRODUCT_NAME} rootfs cached from prebuilt: ${cached}`);
+          return { rootfsPath: cached, fromCache: true, built: true, resizeRootfs };
+        } catch (error) {
+          await rm(tmp, { force: true });
+          throw error;
+        }
+      } else if (prebuiltMode === "require") {
+        throw new NodeVmmError(`required prebuilt rootfs unavailable for ${image}: ${fetched.reason ?? "unknown error"}`);
+      }
+    }
+  } else if (prebuiltMode === "require") {
+    throw new NodeVmmError(`required prebuilt rootfs unavailable for ${image ?? "this rootfs input"}`);
+  }
+
   try {
     await buildRootfs({ ...buildOptions, output: tmp });
     await rename(tmp, cached);
     params.logger?.(`${PRODUCT_NAME} rootfs cached: ${cached}`);
-    return { rootfsPath: cached, fromCache: true, built: true };
+    return { rootfsPath: cached, fromCache: true, built: true, resizeRootfs: false };
   } catch (error) {
     await rm(tmp, { force: true });
     throw error;
   }
+}
+
+interface PreparedRootDisk {
+  rootfsPath: string;
+  fromCache: boolean;
+  built: boolean;
+  resizeRootfs: boolean;
+  persistent: boolean;
+}
+
+function validateRunRootDiskOptionShape(operation: "run" | "start", options: SdkRunOptions): void {
+  if (options.persist && options.diskPath) {
+    throw new NodeVmmError("--persist and diskPath/--disk PATH cannot be combined");
+  }
+  if (options.rootfsPath && options.diskPath) {
+    throw new NodeVmmError(`rootfsPath and diskPath cannot both be set for ${operation}`);
+  }
+  if (options.reset && !options.diskPath && !options.persist) {
+    throw new NodeVmmError("--reset requires --persist or --disk PATH");
+  }
+}
+
+function rootDiskSourceKey(options: SdkRunOptions | SdkPrepareOptions, baseRootfsPath: string): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        version: ROOTFS_CACHE_VERSION,
+        image: options.image,
+        rootfsPath: options.rootfsPath ? path.resolve(options.rootfsPath) : undefined,
+        baseRootfsPath,
+        buildArgs: options.buildArgs ?? {},
+        env: options.env ?? {},
+        entrypoint: options.entrypoint,
+        workdir: options.workdir,
+        platformArch: options.platformArch,
+        dockerfileRunTimeoutMs: options.dockerfileRunTimeoutMs,
+      }),
+    )
+    .digest("hex");
+}
+
+async function prepareRunRootDisk(params: {
+  operation: "run" | "start";
+  id: string;
+  options: SdkRunOptions;
+  defaults: Required<Omit<NodeVmmClientOptions, "logger">> & { logger?: (message: string) => void };
+  tempDir: string;
+  interactive: boolean;
+}): Promise<PreparedRootDisk> {
+  const options = params.options;
+  validateRunRootDiskOptionShape(params.operation, options);
+  const diskMiB = diskMiBFromOptions(options, 2048);
+  const cacheDir = resolvePath(params.defaults.cwd, options.cacheDir || params.defaults.cacheDir);
+  const explicitDiskPath = options.diskPath ? resolvePath(params.defaults.cwd, options.diskPath) : "";
+
+  if (explicitDiskPath && (await pathExists(explicitDiskPath)) && !options.reset) {
+    const resized = await ensureDiskSizeAtLeast(explicitDiskPath, diskMiB);
+    return { rootfsPath: explicitDiskPath, fromCache: false, built: false, resizeRootfs: resized, persistent: true };
+  }
+
+  if (explicitDiskPath && !options.rootfsPath && !hasRootfsBuildInput(options)) {
+    throw new NodeVmmError(`${params.operation} cannot create --disk PATH without rootfsPath, image, dockerfile, or repo`);
+  }
+  let baseRootfsPath = options.rootfsPath ? resolvePath(params.defaults.cwd, options.rootfsPath) : path.join(params.tempDir, `${params.id}.ext4`);
+  let builtRootfs = !options.rootfsPath;
+  let rootfsFromCache = false;
+  let resizeRootfs = false;
+
+  if (builtRootfs) {
+    if (!options.image && !options.dockerfile && !options.repo) {
+      throw new NodeVmmError(`${params.operation} requires rootfsPath, diskPath, image, dockerfile, or repo`);
+    }
+    const source = await resolveSourceContext(options, params.defaults, params.tempDir);
+    const prepared = await buildOrReuseRootfs({
+      options: { ...options, initMode: options.initMode ?? (params.interactive ? "interactive" : "batch") },
+      source,
+      output: baseRootfsPath,
+      tempDir: params.tempDir,
+      cacheDir,
+      logger: params.defaults.logger,
+    });
+    baseRootfsPath = prepared.rootfsPath;
+    rootfsFromCache = prepared.fromCache;
+    builtRootfs = prepared.built;
+    resizeRootfs = prepared.resizeRootfs;
+  }
+
+  if (explicitDiskPath) {
+    const materialized = await materializeExplicitDisk({
+      diskPath: explicitDiskPath,
+      baseRootfsPath,
+      diskMiB,
+      reset: options.reset,
+      logger: params.defaults.logger,
+    });
+    return {
+      rootfsPath: materialized.rootfsPath,
+      fromCache: false,
+      built: builtRootfs || materialized.created,
+      resizeRootfs: resizeRootfs || materialized.resized,
+      persistent: true,
+    };
+  }
+
+  if (options.persist) {
+    const materialized = await materializePersistentDisk({
+      name: options.persist,
+      baseRootfsPath,
+      cacheDir,
+      sourceKey: rootDiskSourceKey(options, baseRootfsPath),
+      diskMiB,
+      reset: options.reset,
+      logger: params.defaults.logger,
+    });
+    return {
+      rootfsPath: materialized.rootfsPath,
+      fromCache: false,
+      built: builtRootfs || materialized.created,
+      resizeRootfs: resizeRootfs || materialized.resized,
+      persistent: true,
+    };
+  }
+
+  return { rootfsPath: baseRootfsPath, fromCache: rootfsFromCache, built: builtRootfs, resizeRootfs, persistent: false };
 }
 
 async function hardlinkOrCopy(source: string, dest: string): Promise<void> {
@@ -586,6 +1174,11 @@ export async function buildRootfsImage(
   options: SdkBuildOptions,
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<SdkBuildResult> {
+  const capabilities = hostCapabilities();
+  if (!hasRootfsBuildInput(options)) {
+    throw new NodeVmmError("build requires --image, --dockerfile, or --repo");
+  }
+  assertRootfsBuildSupportedForCapabilities("build", options, capabilities);
   const defaults = withDefaults(clientOptions);
   const outputPath = resolvePath(defaults.cwd, options.output);
   const tempDir = options.tempDir ? resolvePath(defaults.cwd, options.tempDir) : await makeTempDir(`${PRODUCT_NAME}-build-`);
@@ -623,13 +1216,16 @@ export async function runImage(
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<SdkRunResult> {
   options.signal?.throwIfAborted();
+  const capabilities = hostCapabilities();
+  validateRootfsOptionsForCapabilities("run", options, capabilities);
+  validateRunRootDiskOptionShape("run", options);
   const defaults = withDefaults(clientOptions);
   const id = options.id || randomId("vm");
   const kernelPath = await kernelPathFromOptions(defaults, options);
   const interactive = interactiveForRun(options);
   assertInteractiveTty(interactive, "interactive shell");
-  validateVmOptions(options);
-  probeKvm();
+  validateVmOptions(options, capabilities);
+  assertVmRuntimeAvailable(capabilities);
 
   const tempDir = options.tempDir ? resolvePath(defaults.cwd, options.tempDir) : await makeTempDir(`${PRODUCT_NAME}-run-${id}-`);
   const ownsTemp = !options.tempDir;
@@ -637,32 +1233,20 @@ export async function runImage(
   let rootfsPath = "";
   let overlayPath: string | undefined;
   let overlayTempDir = "";
+  let attachedDisks: ResolvedAttachedDisk[] = [];
+  let resizeRootfs = false;
   let builtRootfs = false;
   let generatedOverlay = false;
 
   try {
-    network = await setupVmNetwork({ id, network: networkFromOptions(options), tapName: options.tapName, ports: options.ports });
-    rootfsPath = options.rootfsPath ? resolvePath(defaults.cwd, options.rootfsPath) : path.join(tempDir, `${id}.ext4`);
-    builtRootfs = !options.rootfsPath;
-    let rootfsFromCache = false;
-    if (builtRootfs) {
-      if (!options.image && !options.dockerfile && !options.repo) {
-        throw new NodeVmmError("run requires rootfsPath, image, dockerfile, or repo");
-      }
-      const source = await resolveSourceContext(options, defaults, tempDir);
-      const prepared = await buildOrReuseRootfs({
-        options: { ...options, initMode: options.initMode ?? (interactive ? "interactive" : "batch") },
-        source,
-        output: rootfsPath,
-        tempDir,
-        cacheDir: resolvePath(defaults.cwd, options.cacheDir || defaults.cacheDir),
-        logger: defaults.logger,
-      });
-      rootfsPath = prepared.rootfsPath;
-      rootfsFromCache = prepared.fromCache;
-      builtRootfs = prepared.built;
-    }
-    const needsOverlay = restoreEnabled(options) || rootfsFromCache;
+    network = await setupVmNetwork({ id, network: networkFromOptions(options, capabilities), tapName: options.tapName, ports: options.ports });
+    const preparedDisk = await prepareRunRootDisk({ operation: "run", id, options, defaults, tempDir, interactive });
+    rootfsPath = preparedDisk.rootfsPath;
+    builtRootfs = preparedDisk.built;
+    resizeRootfs = preparedDisk.resizeRootfs;
+    attachedDisks = resolveAttachedDisks(defaults.cwd, options.attachDisks);
+    await validateAttachedDiskPaths(attachedDisks);
+    const needsOverlay = restoreEnabled(options) || (preparedDisk.fromCache && !preparedDisk.persistent);
     generatedOverlay = needsOverlay && !options.overlayPath;
     overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
     overlayPath = needsOverlay
@@ -670,6 +1254,7 @@ export async function runImage(
         ? resolvePath(defaults.cwd, options.overlayPath)
         : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
       : undefined;
+    await validateRootfsRuntimePathForCapabilities("run", options, rootfsPath, capabilities);
 
     defaults.logger?.(`${PRODUCT_NAME} starting ${id}`);
     if (network.mode === "tap") {
@@ -684,25 +1269,42 @@ export async function runImage(
       defaults.logger?.(`${PRODUCT_NAME} console enabled; type \`exit\` or Ctrl-D to stop the guest`);
     }
 
+    const bootProfile = backendBootArgs(capabilities, interactive);
     const kvm = await runKvmVmAsync(
       {
         kernelPath: resolvePath(defaults.cwd, kernelPath),
         rootfsPath,
         overlayPath,
         memMiB: memoryFromOptions(options),
-        cpus: cpusFromOptions(options),
+        cpus: cpusFromOptions(options, capabilities),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,
-          [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
+          [
+            network.mode === "slirp" ? virtioNetKernelArg(attachedDisks.length, capabilities.backend) : undefined,
+            network.kernelIpArg,
+            network.kernelNetArgs,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          virtioExtraBlkKernelArgs(attachedDisks.length, capabilities.backend),
           commandBootArg(options.cmd),
           fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
+          resizeRootfsBootArg(resizeRootfs),
+          bootProfile.interactiveArg,
+          bootProfile.windowsConsoleArg,
+          bootProfile.windowsConsoleRouteArg,
+          bootProfile.windowsConsoleSizeArg,
+          bootProfile.backend,
         ),
         timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
         consoleLimit: options.consoleLimit,
         interactive,
+        attachDisks: attachedDisks.map((disk) => ({ path: disk.path, readonly: disk.readonly })),
         netTapName: network.tapName,
         netGuestMac: network.guestMac,
+        netSlirpEnabled: network.mode === "slirp",
+        netSlirpHostFwds: network.hostFwds,
       },
       { signal: options.signal },
     );
@@ -716,6 +1318,7 @@ export async function runImage(
       overlayPath,
       restored: Boolean(overlayPath),
       builtRootfs,
+      attachedDisks,
       network,
       kvm,
       guestOutput: guest.output,
@@ -737,13 +1340,16 @@ export async function startVm(
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<RunningVm> {
   options.signal?.throwIfAborted();
+  const capabilities = hostCapabilities();
+  validateRootfsOptionsForCapabilities("start", options, capabilities);
+  validateRunRootDiskOptionShape("start", options);
   const defaults = withDefaults(clientOptions);
   const id = options.id || randomId("vm");
   const kernelPath = await kernelPathFromOptions(defaults, options);
   const interactive = interactiveForRun(options);
   assertInteractiveTty(interactive, "interactive shell");
-  validateVmOptions(options);
-  probeKvm();
+  validateVmOptions(options, capabilities);
+  assertVmRuntimeAvailable(capabilities);
 
   const tempDir = options.tempDir ? resolvePath(defaults.cwd, options.tempDir) : await makeTempDir(`${PRODUCT_NAME}-run-${id}-`);
   const ownsTemp = !options.tempDir;
@@ -751,6 +1357,8 @@ export async function startVm(
   let rootfsPath = "";
   let overlayPath: string | undefined;
   let overlayTempDir = "";
+  let attachedDisks: ResolvedAttachedDisk[] = [];
+  let resizeRootfs = false;
   let builtRootfs = false;
   let generatedOverlay = false;
   let cleaned = false;
@@ -769,28 +1377,14 @@ export async function startVm(
   };
 
   try {
-    network = await setupVmNetwork({ id, network: networkFromOptions(options), tapName: options.tapName, ports: options.ports });
-    rootfsPath = options.rootfsPath ? resolvePath(defaults.cwd, options.rootfsPath) : path.join(tempDir, `${id}.ext4`);
-    builtRootfs = !options.rootfsPath;
-    let rootfsFromCache = false;
-    if (builtRootfs) {
-      if (!options.image && !options.dockerfile && !options.repo) {
-        throw new NodeVmmError("start requires rootfsPath, image, dockerfile, or repo");
-      }
-      const source = await resolveSourceContext(options, defaults, tempDir);
-      const prepared = await buildOrReuseRootfs({
-        options: { ...options, initMode: options.initMode ?? (interactive ? "interactive" : "batch") },
-        source,
-        output: rootfsPath,
-        tempDir,
-        cacheDir: resolvePath(defaults.cwd, options.cacheDir || defaults.cacheDir),
-        logger: defaults.logger,
-      });
-      rootfsPath = prepared.rootfsPath;
-      rootfsFromCache = prepared.fromCache;
-      builtRootfs = prepared.built;
-    }
-    const needsOverlay = restoreEnabled(options) || rootfsFromCache;
+    network = await setupVmNetwork({ id, network: networkFromOptions(options, capabilities), tapName: options.tapName, ports: options.ports });
+    const preparedDisk = await prepareRunRootDisk({ operation: "start", id, options, defaults, tempDir, interactive });
+    rootfsPath = preparedDisk.rootfsPath;
+    builtRootfs = preparedDisk.built;
+    resizeRootfs = preparedDisk.resizeRootfs;
+    attachedDisks = resolveAttachedDisks(defaults.cwd, options.attachDisks);
+    await validateAttachedDiskPaths(attachedDisks);
+    const needsOverlay = restoreEnabled(options) || (preparedDisk.fromCache && !preparedDisk.persistent);
     generatedOverlay = needsOverlay && !options.overlayPath;
     overlayTempDir = generatedOverlay ? await makeOverlayTempDir(id, defaults, options) : "";
     overlayPath = needsOverlay
@@ -798,6 +1392,7 @@ export async function startVm(
         ? resolvePath(defaults.cwd, options.overlayPath)
         : path.join(overlayTempDir || tempDir, `${id}.restore.overlay`)
       : undefined;
+    await validateRootfsRuntimePathForCapabilities("start", options, rootfsPath, capabilities);
 
     defaults.logger?.(`${PRODUCT_NAME} starting ${id}`);
     if (network.mode === "tap") {
@@ -809,25 +1404,42 @@ export async function startVm(
       );
     }
 
+    const bootProfile = backendBootArgs(capabilities, interactive);
     const nativeHandle = runKvmVmControlled(
       {
         kernelPath: resolvePath(defaults.cwd, kernelPath),
         rootfsPath,
         overlayPath,
         memMiB: memoryFromOptions(options),
-        cpus: cpusFromOptions(options),
+        cpus: cpusFromOptions(options, capabilities),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,
-          [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
+          [
+            network.mode === "slirp" ? virtioNetKernelArg(attachedDisks.length, capabilities.backend) : undefined,
+            network.kernelIpArg,
+            network.kernelNetArgs,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          virtioExtraBlkKernelArgs(attachedDisks.length, capabilities.backend),
           commandBootArg(options.cmd),
           fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
+          resizeRootfsBootArg(resizeRootfs),
+          bootProfile.interactiveArg,
+          bootProfile.windowsConsoleArg,
+          bootProfile.windowsConsoleRouteArg,
+          bootProfile.windowsConsoleSizeArg,
+          bootProfile.backend,
         ),
         timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
         consoleLimit: options.consoleLimit,
         interactive,
+        attachDisks: attachedDisks.map((disk) => ({ path: disk.path, readonly: disk.readonly })),
         netTapName: network.tapName,
         netGuestMac: network.guestMac,
+        netSlirpEnabled: network.mode === "slirp",
+        netSlirpHostFwds: network.hostFwds,
       },
       { signal: options.signal },
     );
@@ -843,6 +1455,7 @@ export async function startVm(
           id,
           rootfsPath,
           overlayPath,
+          attachedDisks,
           restored: Boolean(overlayPath),
           builtRootfs,
           network: network as NetworkConfig,
@@ -857,6 +1470,7 @@ export async function startVm(
       id,
       rootfsPath,
       overlayPath,
+      attachedDisks,
       restored: Boolean(overlayPath),
       builtRootfs,
       network,
@@ -893,6 +1507,7 @@ export async function bootRootfs(
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<SdkRunResult> {
   options.signal?.throwIfAborted();
+  const capabilities = hostCapabilities();
   const defaults = withDefaults(clientOptions);
   const id = options.id || randomId("vm");
   const kernelPath = await kernelPathFromOptions(defaults, options);
@@ -905,11 +1520,12 @@ export async function bootRootfs(
   }
   const interactive = options.interactive ?? false;
   assertInteractiveTty(interactive, "boot --interactive");
-  validateVmOptions(options);
-  probeKvm();
+  validateVmOptions(options, capabilities);
+  assertVmRuntimeAvailable(capabilities);
 
   let overlayTempDir = "";
   let overlayPath: string | undefined;
+  let attachedDisks: ResolvedAttachedDisk[] = [];
   let network: NetworkConfig | undefined;
   try {
     overlayTempDir = restoreEnabled(options) && !options.overlayPath ? await makeOverlayTempDir(id, defaults, options) : "";
@@ -918,7 +1534,7 @@ export async function bootRootfs(
         ? resolvePath(defaults.cwd, options.overlayPath)
         : path.join(overlayTempDir, `${id}.restore.overlay`)
       : undefined;
-    network = await setupVmNetwork({ id, network: networkFromOptions(options), tapName: options.tapName, ports: options.ports });
+    network = await setupVmNetwork({ id, network: networkFromOptions(options, capabilities), tapName: options.tapName, ports: options.ports });
     defaults.logger?.(`${PRODUCT_NAME} booting ${id}`);
     if (network.mode === "tap") {
       defaults.logger?.(`${PRODUCT_NAME} network enabled: ${network.tapName} ${network.guestMac}`);
@@ -932,25 +1548,45 @@ export async function bootRootfs(
       defaults.logger?.(`${PRODUCT_NAME} console enabled; type \`exit\` or Ctrl-D to stop the guest`);
     }
     const resolvedRootfs = resolvePath(defaults.cwd, rootfsPath);
+    attachedDisks = resolveAttachedDisks(defaults.cwd, options.attachDisks);
+    await validateAttachedDiskPaths(attachedDisks);
+    await validateRootfsRuntimePathForCapabilities("boot", options, resolvedRootfs, capabilities);
+    const bootProfile = backendBootArgs(capabilities, interactive);
     const kvm = await runKvmVmAsync(
       {
         kernelPath: resolvePath(defaults.cwd, kernelPath),
         rootfsPath: resolvedRootfs,
         overlayPath,
         memMiB: memoryFromOptions(options),
-        cpus: cpusFromOptions(options),
+        cpus: cpusFromOptions(options, capabilities),
         cmdline: kernelCmdline(
           options.cmdline,
           options.bootArgs,
-          [network.kernelIpArg, network.kernelNetArgs].filter(Boolean).join(" "),
+          [
+            network.mode === "slirp" ? virtioNetKernelArg(attachedDisks.length, capabilities.backend) : undefined,
+            network.kernelIpArg,
+            network.kernelNetArgs,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          virtioExtraBlkKernelArgs(attachedDisks.length, capabilities.backend),
           undefined,
           fastExitBootArg(options.fastExit === true && Boolean(overlayPath) && !interactive),
+          undefined,
+          bootProfile.interactiveArg,
+          bootProfile.windowsConsoleArg,
+          bootProfile.windowsConsoleRouteArg,
+          bootProfile.windowsConsoleSizeArg,
+          bootProfile.backend,
         ),
         timeoutMs: timeoutForMode(options.timeoutMs, interactive, (network.ports?.length ?? 0) > 0),
         consoleLimit: options.consoleLimit,
         interactive,
+        attachDisks: attachedDisks.map((disk) => ({ path: disk.path, readonly: disk.readonly })),
         netTapName: network.tapName,
         netGuestMac: network.guestMac,
+        netSlirpEnabled: network.mode === "slirp",
+        netSlirpHostFwds: network.hostFwds,
       },
       { signal: options.signal },
     );
@@ -958,6 +1594,7 @@ export async function bootRootfs(
       id,
       rootfsPath: resolvedRootfs,
       overlayPath,
+      attachedDisks,
       restored: Boolean(overlayPath),
       builtRootfs: false,
       network,
@@ -976,6 +1613,9 @@ export async function createSnapshot(
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<SdkRunResult> {
   options.signal?.throwIfAborted();
+  const capabilities = hostCapabilities();
+  validateRootfsOptionsForCapabilities("snapshot create", options, capabilities);
+  validateVmOptions(options, capabilities);
   const defaults = withDefaults(clientOptions);
   const id = options.id || randomId("snapshot");
   const kernelPath = await kernelPathFromOptions(defaults, options);
@@ -1011,18 +1651,20 @@ export async function createSnapshot(
         signal: options.signal,
       });
     }
+    await validateRootfsRuntimePathForCapabilities("snapshot create", options, rootfsPath, capabilities);
 
     const manifest = await writeSnapshotBundle({
       snapshotDir,
       rootfsPath,
       kernelPath,
       memory: memoryFromOptions(options),
-      cpus: cpusFromOptions(options),
+      cpus: cpusFromOptions(options, capabilities),
     });
     rootfsPath = path.join(snapshotDir, manifest.rootfs);
     return {
       id,
       rootfsPath,
+      attachedDisks: [],
       restored: false,
       builtRootfs,
       network: { mode: "none" },
@@ -1070,6 +1712,9 @@ export async function prepareSandbox(
   clientOptions: NodeVmmClientOptions = {},
 ): Promise<PreparedSandbox> {
   options.signal?.throwIfAborted();
+  const capabilities = hostCapabilities();
+  validateRootfsOptionsForCapabilities("prepare", options, capabilities);
+  validateVmOptions(options, capabilities);
   const defaults = withDefaults(clientOptions);
   const id = options.id || randomId("template");
   const tempDir = options.tempDir ? resolvePath(defaults.cwd, options.tempDir) : await makeTempDir(`${PRODUCT_NAME}-template-${id}-`);
@@ -1157,8 +1802,29 @@ export function features(): string[] {
 
 export async function doctor(): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
-  if (hostBackend() === "whp") {
-    checks.push({ name: "platform", ok: true, label: "Windows host" });
+  const capabilities = hostCapabilities();
+  if (capabilities.backend === "whp") {
+    checks.push({ name: "platform", ok: true, label: "Windows x64 host" });
+    if (!(await commandExists("wsl.exe"))) {
+      checks.push({ name: "rootfs-builder", ok: false, label: "WSL2 is required for Windows OCI rootfs builds" });
+    } else {
+      const wslTools = ["truncate", "mkfs.ext4", "mount", "umount", "python3"];
+      const wslCheck = await runCommand(
+        "wsl.exe",
+        ["-u", "root", "sh", "-lc", wslTools.map((command) => `command -v ${shellQuote(command)} >/dev/null`).join(" && ")],
+        { capture: true, allowFailure: true },
+      );
+      checks.push({
+        name: "rootfs-builder",
+        ok: wslCheck.code === 0,
+        label:
+          wslCheck.code === 0
+            ? "WSL2 OCI rootfs builder ready"
+            : `WSL2 missing rootfs tool(s): ${wslTools.join(", ")}`,
+      });
+    }
+    checks.push({ name: "network", ok: true, label: "WHP virtio-net/libslirp networking and TCP publish are available" });
+    checks.push({ name: "smp", ok: true, label: `WHP vCPU range ${capabilities.minCpus}-${capabilities.rootfsMaxCpus}` });
     try {
       const probe = probeWhp();
       checks.push({
@@ -1178,8 +1844,8 @@ export async function doctor(): Promise<DoctorResult> {
     }
     return { ok: checks.every((check) => check.ok), checks };
   }
-  if (hostBackend() === "unsupported") {
-    checks.push({ name: "platform", ok: false, label: `${process.platform}/${process.arch} is not supported yet` });
+  if (capabilities.backend === "unsupported") {
+    checks.push({ name: "platform", ok: false, label: `${capabilities.platform}/${capabilities.arch} is not supported yet` });
     return { ok: false, checks };
   }
   for (const command of [

@@ -13,6 +13,18 @@ npm run test:real-apps
 npm run bench:node-code
 ```
 
+`npm test` is the local all-in-one smoke: it rebuilds native + TypeScript and
+runs every deterministic test file in `dist/test`. On Windows/WHP this includes
+the native WHP probe, tiny guests, lifecycle, SMP, UART, virtio-blk, prebuilt
+manifest tests, CLI/SDK disk parsing, and docs-backed attach-disk contract
+tests. Environment-gated tests are listed in the output as skipped until their
+kernel/rootfs fixtures are provided.
+
+The 100% badge refers to the strict `c8 --100` TypeScript coverage gate below.
+Native C++ coverage is separate and backend-specific; Linux/KVM uses gcov, while
+Windows/WHP currently relies on smoke/e2e gates plus the self-hosted runner
+matrix.
+
 ## TypeScript
 
 `npm run test:coverage:ts` runs `c8 --100` against deterministic TypeScript
@@ -166,6 +178,69 @@ The script uses only temporary npm and OCI caches under
 `/tmp/node-vmm-real-apps-*`; it does not use the user's global npm cache. It
 removes generated apps, rootfs disks, caches, and overlays in `finally`, with a
 `sudo -n rm -rf` fallback for root-owned build artifacts.
+
+## Windows WHP Framework App Smoke
+
+`npm run test:whp-apps` is the Windows/WHP runtime counterpart to the Linux
+real-app gate. It uses `node:22-alpine`, creates the same framework apps inside
+the guest, publishes guest port `3000` through WHP/libslirp, waits for HTTP,
+pauses the VM, verifies HTTP blocks while paused, resumes the VM, verifies HTTP
+again, and stops the VM.
+
+```powershell
+npm run test:whp-apps
+```
+
+It covers:
+
+- plain Node HTTP
+- Express
+- Fastify
+- official Next.js hello-world via `create-next-app@16.2.4`
+- Vite React via `create-vite@9.0.6 --template react`
+- Vite Vue via `create-vite@9.0.6 --template vue`
+
+Use `NODE_VMM_WHP_APP_CASES=express,fastify` to run a subset while debugging.
+This smoke proves the WHP VM runtime, port publishing, guest networking, and
+pause/resume behavior for the same app families as Linux. It does not replace
+the Linux Dockerfile builder gate; custom Dockerfile and repo rootfs builds on
+Windows intentionally continue to use the Linux/WSL2 builder path.
+
+## Windows Coverage Matrix
+
+| Surface | Command or test | What it proves |
+| --- | --- | --- |
+| Hosted Windows package shape | `NODE_VMM_SKIP_NATIVE=1 npm ci --ignore-scripts`, `npm run build:ts`, `npm pack --dry-run --ignore-scripts` | Windows can install/import/pack the JS package without native WHP execution. |
+| WHP probe and dirty tracking | `node --test .\dist\test\native.test.js` | `probeWhp()` and `whpSmokeHlt()` can create a partition, run a tiny guest, and query dirty pages. |
+| WHP lifecycle and SMP smoke | `node --test .\dist\test\native.test.js` | Generated ELF guests cover run, pause/resume/stop, and multi-vCPU control. |
+| Real Alpine WHP e2e | `$env:NODE_VMM_WHP_FULL_E2E = "1"; node --test .\dist\test\native.test.js` | Alpine rootfs boot, virtio block overlay, Slirp DNS/networking, TCP-ready runtime pieces, RNG, clock, `apk`, console idle CPU, and guest Ctrl-C. |
+| Framework runtime smoke | `npm run test:whp-apps` | Plain Node, Express, Fastify, Next.js, Vite React, and Vite Vue run inside WHP through `node:22-alpine` with HTTP plus pause/resume checks. |
+| Prebuilt rootfs slug parity | `prebuiltSlugForImage maps the published images and rejects others` in `test/unit.test.ts` | Supported image refs stay aligned with release asset names. |
+| Prebuilt fallback | `tryFetchPrebuiltRootfs returns fetched:false on missing release` in `test/unit.test.ts` | Missing release assets do not throw or leave partial disks; callers can fall back to WSL2. |
+| No-WSL cache hit | `buildOrReuseRootfs cache hit returns the cached path without rebuilding (no WSL2 spawn)` in `test/unit.test.ts` | Prepared rootfs cache hits return before any builder path. |
+| No-WSL explicit rootfs | `runImage with --rootfs never enters the build pipeline` in `test/unit.test.ts` | `rootfsPath`/`--rootfs` never invokes WSL2 or rootfs creation. |
+| Prebuilt release asset production | `.github/workflows/prebuilt-rootfs.yml` | Builds `alpine:3.20`, `node:20-alpine`, `node:22-alpine`, and `oven/bun:1-alpine` ext4 assets and uploads `.ext4.gz` plus `.ext4.manifest.json`. |
+| Attach/secondary disks | `NODE_VMM_WHP_ATTACH_DISKS_E2E=1 node --test .\dist\test\native.test.js` plus unit validation | WHP e2e maps a data disk after `/dev/vda` and verifies raw guest writes persist to the host file. |
+
+Recommended local Windows verification after touching WHP/disk code:
+
+```powershell
+npm test
+npm run test:coverage:ts
+node --check .\scripts\build-prebuilt-rootfs.mjs
+node --check .\scripts\package-prebuild.mjs
+git diff --check
+```
+
+Run the fixture-gated WHP rootfs checks when you have a kernel and ext4 rootfs:
+
+```powershell
+$env:NODE_VMM_WHP_E2E_KERNEL = "C:\path\to\vmlinux"
+$env:NODE_VMM_WHP_E2E_ROOTFS = "C:\path\to\alpine.ext4"
+$env:NODE_VMM_WHP_FULL_E2E = "1"
+$env:NODE_VMM_WHP_ATTACH_DISKS_E2E = "1"
+node --test .\dist\test\native.test.js
+```
 
 ## Node Code Benchmark
 

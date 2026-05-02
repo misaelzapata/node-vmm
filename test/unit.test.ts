@@ -11,11 +11,14 @@ import nodeVmmDefault, {
   boot,
   bootRootfs,
   build,
+  buildOrReuseRootfs,
   buildRootfsImage,
+  capabilitiesForHost,
   createSandbox,
   createNodeVmmClient,
   createSnapshot,
   DEFAULT_GOCRACKER_KERNEL,
+  defaultNetworkForCapabilities,
   dirtyRamSnapshotSmoke,
   doctor,
   envKernelPath,
@@ -25,6 +28,7 @@ import nodeVmmDefault, {
   findDefaultKernel,
   features,
   gocrackerKernelUrl,
+  hostBackendForHost,
   nodeVmm,
   parseOptions,
   prepare,
@@ -33,15 +37,22 @@ import nodeVmmDefault, {
   requireKernelPath,
   restore,
   restoreSnapshot,
+  rootfsCacheKey,
   run,
   runCode,
   runImage,
   runKvmVmControlled,
   snapshot,
+  assertRootfsBuildSupportedForCapabilities,
+  validateRootfsOptionsForCapabilities,
+  validateRootfsRuntimeForCapabilities,
+  validateVmOptionsForCapabilities,
   type NodeVmmClient,
 } from "../src/index.js";
 import { boolOption, intOption, keyValueOption, stringListOption, stringOption } from "../src/args.js";
-import { defaultKernelCmdline, runKvmVm, runKvmVmAsync } from "../src/kvm.js";
+import { defaultKernelCmdline, runKvmVm, runKvmVmAsync, virtioExtraBlkKernelArgs, virtioNetKernelArg } from "../src/kvm.js";
+import { main, networkOption } from "../src/cli.js";
+import type { NativeWhpBackend, WhpRunConfig, WhpRunResult } from "../src/native.js";
 import { parsePortForward, setupNetwork } from "../src/net.js";
 import { hostArchToOci, parseImageReference } from "../src/oci.js";
 import { commandExists, requireCommands, runCommand } from "../src/process.js";
@@ -106,6 +117,18 @@ test("option helpers parse integers and key-value lists", () => {
   assert.throws(() => intOption(parseOptions(["--num", "-1"], new Set()), "num", 0), /non-negative integer/);
 });
 
+test("CLI network option preserves host backend defaults when omitted", () => {
+  const flags = new Set<string>(["net"]);
+  assert.equal(networkOption(parseOptions([], new Set<string>(), flags)), undefined);
+  assert.equal(networkOption(parseOptions(["--net", "none"], new Set<string>(), flags)), "none");
+  assert.equal(networkOption(parseOptions(["--net=auto"], new Set<string>(), flags)), "auto");
+  assert.equal(networkOption(parseOptions(["--net=slirp"], new Set<string>(), flags)), "slirp");
+  assert.throws(
+    () => networkOption(parseOptions(["--net", "bad"], new Set<string>(), flags)),
+    /--net must be auto, none, tap, or slirp/,
+  );
+});
+
 test("parseKeyValueList supports comma-separated values", () => {
   assert.deepEqual(parseKeyValueList(["A=1,B=2", "C=three"]), {
     A: "1",
@@ -152,7 +175,25 @@ test("defaultKernelCmdline includes the v1 root disk and virtio-mmio block devic
   assert.match(args, /init=\/init/);
   assert.match(args, /console=ttyS0/);
   assert.match(args, /rootwait/);
-  assert.match(args, /virtio_mmio\.device=0x1000@0xd0000000:5/);
+  assert.match(args, /virtio_mmio\.device=512@0xd0000000:5/);
+});
+
+test("virtio-mmio kernel args place attached disks and net devices after the root disk", () => {
+  assert.equal(virtioExtraBlkKernelArgs(0), "");
+  assert.equal(
+    virtioExtraBlkKernelArgs(2),
+    "virtio_mmio.device=512@0xd0001000:6 virtio_mmio.device=512@0xd0002000:7",
+  );
+  assert.equal(
+    virtioExtraBlkKernelArgs(2, "whp"),
+    "virtio_mmio.device=512@0xd0000200:6 virtio_mmio.device=512@0xd0000400:7",
+  );
+  assert.equal(virtioNetKernelArg(2), "virtio_mmio.device=512@0xd0003000:8");
+  assert.equal(virtioNetKernelArg(2, "whp"), "virtio_mmio.device=512@0xd0000600:8");
+  assert.throws(() => virtioExtraBlkKernelArgs(-1), /attached disk count/);
+  assert.throws(() => virtioExtraBlkKernelArgs(1.5), /attached disk count/);
+  assert.throws(() => virtioNetKernelArg(-1), /attached disk count/);
+  assert.throws(() => virtioNetKernelArg(1.5), /attached disk count/);
 });
 
 test("renderInitScript supports batch and interactive modes", () => {
@@ -165,11 +206,12 @@ test("renderInitScript supports batch and interactive modes", () => {
   assert.match(batch, /node_vmm\.fast_exit=1/);
   assert.match(batch, /dd of=\/dev\/port bs=1 seek=1281/);
   assert.match(batch, /node_vmm_cat_console \/tmp\/node-vmm-command\.out/);
-  assert.match(batch, /\[ -e \/dev\/console \] && \[ ! -c \/dev\/console \]/);
-  assert.match(batch, /mkdir -p \/dev/);
-  assert.match(batch, /mknod \/dev\/ttyS0 c 4 64/);
-  assert.match(batch, /mknod \/dev\/random c 1 8/);
-  assert.match(batch, /mknod \/dev\/urandom c 1 9/);
+  // /dev population now prefers devtmpfs (auto-creates console/ttyS0/null/...)
+  // and only falls back to a manual mknod loop if devtmpfs failed. Tests pin
+  // both halves of that path so a regression is caught either way.
+  assert.match(batch, /mount -t devtmpfs devtmpfs \/dev/);
+  assert.match(batch, /console:5:1 ttyS0:4:64 null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 port:1:4/);
+  assert.match(batch, /mknod "\/dev\/\$name" c "\$major" "\$minor"/);
   assert.match(batch, /mount -t tmpfs tmpfs \/dev\/shm/);
   assert.match(batch, /ln -s pts\/ptmx \/dev\/ptmx/);
   assert.match(batch, /node_vmm\.iface=/);
@@ -177,10 +219,27 @@ test("renderInitScript supports batch and interactive modes", () => {
   assert.match(batch, /NODE_VMM_RUNTIME_DNS/);
   assert.match(batch, /ip addr add "\$NODE_VMM_ADDR" dev "\$NODE_VMM_IFACE"/);
 
+  // The init script now ships BOTH branches and switches based on
+  // node_vmm.interactive=1 from /proc/cmdline, so the rootfs cache is shared
+  // across batch/interactive runs.
   const interactive = renderInitScript({ commandLine: "/bin/sh", workdir: "/", mode: "interactive" });
   assert.match(interactive, /interactive: \$NODE_VMM_COMMAND/);
-  assert.doesNotMatch(interactive, /node-vmm-command\.out/);
+  assert.match(interactive, /node-vmm-command\.out/);
   assert.match(interactive, /\/node-vmm\/console \/bin\/sh -lc "\$NODE_VMM_COMMAND"/);
+  assert.match(interactive, /node_vmm\.interactive=1\)\s+NODE_VMM_INTERACTIVE=1/);
+  assert.match(interactive, /NODE_VMM_WINDOWS_CONSOLE=0/);
+  assert.match(interactive, /NODE_VMM_TTY_COLS=80/);
+  assert.match(interactive, /NODE_VMM_TTY_ROWS=24/);
+  assert.match(interactive, /NODE_VMM_WHP_CONSOLE_ROUTE=getty/);
+  assert.match(interactive, /node_vmm\.windows_console=1\|node_vmm\.getty=1\)/);
+  assert.match(interactive, /node_vmm\.console_route=pty\)/);
+  assert.match(interactive, /node_vmm\.tty_cols=\*/);
+  assert.match(interactive, /node_vmm\.tty_rows=\*/);
+  assert.match(interactive, /export NODE_VMM_TTY_COLS NODE_VMM_TTY_ROWS/);
+  assert.match(interactive, /\$NODE_VMM_WINDOWS_CONSOLE" = "1" \] && \[ "\$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" \] && command -v getty/);
+  assert.match(interactive, /stty -F "\$1" rows "\$NODE_VMM_TTY_ROWS" cols "\$NODE_VMM_TTY_COLS"/);
+  assert.match(interactive, /export COLUMNS="\$NODE_VMM_TTY_COLS"/);
+  assert.equal(interactive, renderInitScript({ commandLine: "/bin/sh", workdir: "/" }));
   assert.match(renderInitScript({ commandLine: 'echo "$HOME"', workdir: "srv/app" }), /cd 'srv\/app'/);
 });
 
@@ -242,7 +301,7 @@ test("kernel helpers resolve node-vmm env, cache, gocracker URLs, and downloads"
   assert.equal(envKernelPath({ NODE_VMM_KERNEL: "node" } as NodeJS.ProcessEnv), "node");
   assert.equal(envKernelPath({} as NodeJS.ProcessEnv), undefined);
   assert.equal(defaultKernelCacheDir(env), cacheDir);
-  assert.match(defaultKernelCacheDir({} as NodeJS.ProcessEnv), /node-vmm\/kernels$/);
+  assert.equal(defaultKernelCacheDir({} as NodeJS.ProcessEnv).endsWith(path.join("node-vmm", "kernels")), true);
   assert.equal(gocrackerKernelUrl(DEFAULT_GOCRACKER_KERNEL, env), "https://example.test/kernels/gocracker-guest-standard-vmlinux.gz");
   assert.match(gocrackerKernelUrl("custom", {} as NodeJS.ProcessEnv), /gocracker\/main\/artifacts\/kernels\/custom\.gz$/);
   assert.ok(defaultKernelCandidates({ cwd: dir, env }).includes(cachedKernel));
@@ -494,6 +553,21 @@ test("requireRoot reports non-root users", () => {
   }
 });
 
+test("requireRoot reports a simulated non-root process", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+  const mutableProcess = process as typeof process & { getuid?: () => number };
+  Object.defineProperty(process, "getuid", { configurable: true, value: () => 1000 });
+  try {
+    assert.throws(() => requireRoot("simulated action"), /requires root privileges/);
+  } finally {
+    if (descriptor) {
+      Object.defineProperty(process, "getuid", descriptor);
+    } else {
+      delete mutableProcess.getuid;
+    }
+  }
+});
+
 test("runCommand captures output, input, and failures", async () => {
   const abortedBeforeStart = new AbortController();
   abortedBeforeStart.abort();
@@ -553,11 +627,13 @@ test("runCommand captures output, input, and failures", async () => {
     { timeoutMs: 10, killGraceMs: 20, killTree: true, allowFailure: true },
   );
   assert.equal(forceKilledTree.timedOut, true);
-  const interrupted = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
-    killTree: true,
-  });
-  setTimeout(() => process.kill(process.pid, "SIGTERM"), 20).unref();
-  await assert.rejects(() => interrupted, /command interrupted by SIGTERM/);
+  if (process.platform !== "win32") {
+    const interrupted = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
+      killTree: true,
+    });
+    setTimeout(() => process.kill(process.pid, "SIGTERM"), 20).unref();
+    await assert.rejects(() => interrupted, /command interrupted by SIGTERM/);
+  }
   const abortDuringRun = new AbortController();
   const aborted = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
     signal: abortDuringRun.signal,
@@ -591,6 +667,17 @@ test("setupNetwork supports none and tap modes without mutating host network", a
   await assert.rejects(() => setupNetwork({ id: "vm1", mode: "bad" }), /unsupported network mode/);
 });
 
+test("setupNetwork resolves random slirp host ports", async () => {
+  const network = await setupNetwork({ id: "vm1", mode: "slirp", ports: ["3000", "127.0.0.1:0:3001"] });
+  assert.equal(network.mode, "slirp");
+  assert.deepEqual(network.ports?.map((port) => port.guestPort), [3000, 3001]);
+  assert.ok((network.ports?.[0]?.hostPort ?? 0) > 0);
+  assert.ok((network.hostFwds?.[0]?.hostPort ?? 0) > 0);
+  assert.equal(network.ports?.[0]?.hostPort, network.hostFwds?.[0]?.hostPort);
+  assert.equal(network.hostFwds?.[1]?.hostAddr, "127.0.0.1");
+  await network.cleanup?.();
+});
+
 test("parsePortForward follows Docker publish syntax for TCP ports", () => {
   assert.deepEqual(parsePortForward(3000), { host: "127.0.0.1", hostPort: 0, guestPort: 3000 });
   assert.deepEqual(parsePortForward("3000"), { host: "127.0.0.1", hostPort: 0, guestPort: 3000 });
@@ -610,20 +697,89 @@ test("parsePortForward follows Docker publish syntax for TCP ports", () => {
   assert.throws(() => parsePortForward("host:not-a-port:3000"), /hostPort must be a TCP port number/);
 });
 
+test("host capabilities model backend defaults and WHP runtime limits", () => {
+  const kvm = capabilitiesForHost({ platform: "linux", arch: "x64" });
+  assert.equal(hostBackendForHost({ platform: "linux", arch: "x64" }), "kvm");
+  assert.equal(kvm.archLine, "linux/x86_64");
+  assert.equal(defaultNetworkForCapabilities(kvm, undefined), "auto");
+  assert.equal(defaultNetworkForCapabilities(kvm, undefined, "tap-test"), "tap");
+  assert.equal(kvm.rootfsMaxCpus, 64);
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ cpus: 64, network: "auto", ports: ["3000"] }, kvm));
+  assert.doesNotThrow(() => validateRootfsRuntimeForCapabilities("run", { cpus: 64 }, kvm));
+  assert.doesNotThrow(() => assertRootfsBuildSupportedForCapabilities("run", { image: "alpine:3.20" }, kvm));
+
+  const whp = capabilitiesForHost({ platform: "win32", arch: "x64" });
+  assert.equal(hostBackendForHost({ platform: "win32", arch: "x64" }), "whp");
+  assert.equal(whp.archLine, "windows/x86_64");
+  assert.equal(whp.maxCpus, 64);
+  assert.equal(whp.rootfsMaxCpus, 64);
+  assert.equal(whp.rootfsBuild, true);
+  assert.equal(defaultNetworkForCapabilities(whp, undefined), "auto");
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ cpus: 1, network: "none" }, whp));
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ cpus: 2, network: "none" }, whp));
+  assert.doesNotThrow(() => validateRootfsRuntimeForCapabilities("run", { cpus: 1 }, whp));
+  assert.doesNotThrow(() => validateRootfsRuntimeForCapabilities("run", { cpus: 2 }, whp));
+  assert.doesNotThrow(() => validateRootfsRuntimeForCapabilities("run", { cpus: 64 }, whp));
+  assert.doesNotThrow(() => assertRootfsBuildSupportedForCapabilities("run", { image: "alpine:3.20" }, whp));
+  assert.doesNotThrow(() => assertRootfsBuildSupportedForCapabilities("run", { rootfsPath: "base.ext4" }, whp));
+  assert.doesNotThrow(() => validateRootfsOptionsForCapabilities("run", { rootfsPath: "base.ext4" }, whp));
+  assert.doesNotThrow(() => validateRootfsOptionsForCapabilities("run", { image: "alpine:3.20" }, whp));
+  assert.throws(() => validateRootfsOptionsForCapabilities("run", {}, whp), /run requires rootfsPath, diskPath, image, dockerfile, or repo/);
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ network: "auto" }, whp));
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ network: "slirp" }, whp));
+  assert.throws(() => validateVmOptionsForCapabilities({ network: "tap" }, whp), /network:tap.*network: 'none'/);
+  assert.throws(() => validateVmOptionsForCapabilities({ tapName: "tap-test" }, whp), /TAP networking.*network: 'none'/);
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ ports: ["3000"], network: "slirp" }, whp));
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ ports: ["3000"], network: "auto" }, whp));
+  assert.throws(
+    () => assertRootfsBuildSupportedForCapabilities("prepare", { dockerfile: "Dockerfile" }, whp),
+    /Windows\/WHP.*Dockerfile and repo builds still require Linux/,
+  );
+  assert.throws(
+    () => assertRootfsBuildSupportedForCapabilities("snapshot create", { repo: "https://example.test/repo.git" }, whp),
+    /Dockerfile and repo builds still require Linux/,
+  );
+
+  const unsupported = capabilitiesForHost({ platform: "darwin", arch: "arm64" });
+  assert.equal(unsupported.backend, "unsupported");
+  assert.equal(unsupported.archLine, "darwin/arm64");
+  assert.equal(defaultNetworkForCapabilities(unsupported, undefined), "none");
+});
+
+test("native WHP backend type exposes the runVm contract", () => {
+  const config: WhpRunConfig = {
+    kernelPath: "guest.elf",
+    rootfsPath: "rootfs.ext4",
+    cmdline: "console=ttyS0",
+    memMiB: 64,
+    cpus: 1,
+  };
+  const backend: Pick<NativeWhpBackend, "runVm"> = {
+    runVm(received): WhpRunResult {
+      assert.equal(received, config);
+      return { exitReason: "guest-exit", exitReasonCode: 2, runs: 3, console: "OK" };
+    },
+  };
+  assert.deepEqual(backend.runVm(config), { exitReason: "guest-exit", exitReasonCode: 2, runs: 3, console: "OK" });
+});
+
 test("SDK exposes feature, doctor, and client helpers", async () => {
-  assert.ok(features().some((line) => line.includes("backend: kvm")));
+  const hostCapabilities = capabilitiesForHost();
+  const backendLine = hostCapabilities.backend === "unsupported" ? "backend: none" : `backend: ${hostCapabilities.backend}`;
+  assert.ok(features().some((line) => line.includes(backendLine)));
   assert.equal(nodeVmm, nodeVmmDefault);
   assert.equal(snapshot, createSnapshot);
   assert.equal(restore, restoreSnapshot);
   assert.deepEqual(nodeVmmDefault.features(), features());
   const result = await doctor();
   assert.equal(typeof result.ok, "boolean");
-  assert.ok(result.checks.some((check) => check.name === "/dev/kvm"));
+  assert.ok(result.checks.some((check) => check.name === (hostCapabilities.backend === "whp" ? "whp-api" : hostCapabilities.backend === "kvm" ? "/dev/kvm" : "platform")));
   const client: NodeVmmClient = createNodeVmmClient({ logger: () => undefined });
   const nodeClient: NodeVmmClient = createNodeVmmClient({ logger: () => undefined });
   assert.deepEqual(client.features(), features());
   assert.deepEqual(nodeClient.features(), features());
-  assert.ok(features().some((line) => line.includes("vcpu: 1-64")));
+  assert.ok(features().some((line) => line.includes("vcpu:")));
+  assert.ok(features().some((line) => line.includes("network:")));
   assert.equal(typeof client.run, "function");
   assert.equal(typeof client.runCode, "function");
   assert.equal(typeof client.boot, "function");
@@ -699,7 +855,7 @@ test("core snapshot create writes a reusable bundle manifest", async () => {
     kernel,
     output,
     memory: 512,
-    cpus: 4,
+    cpus: 1,
     net: "none",
   });
 
@@ -713,7 +869,7 @@ test("core snapshot create writes a reusable bundle manifest", async () => {
   const manifest = JSON.parse(await readFile(path.join(output, "snapshot.json"), "utf8"));
   assert.equal(manifest.kind, "node-vmm-rootfs-snapshot");
   assert.equal(manifest.memory, 512);
-  assert.equal(manifest.cpus, 4);
+  assert.equal(manifest.cpus, 1);
   assert.equal(manifest.rootfs, "rootfs.ext4");
   assert.equal(manifest.kernel, "kernel");
 
@@ -775,6 +931,40 @@ test("runKvmVm forwards native validation errors", () => {
       }),
     /kernelPath is required/,
   );
+  assert.throws(
+    () => runKvmVm({ kernelPath: "vmlinux", rootfsPath: "", cmdline: "", memMiB: 1 }),
+    /rootfsPath is required/,
+  );
+  assert.throws(
+    () =>
+      runKvmVm({
+        kernelPath: "vmlinux",
+        rootfsPath: "rootfs.ext4",
+        attachDisks: [{ path: "" }],
+        cmdline: "console=ttyS0",
+        memMiB: 1,
+      }),
+    /attachDisks\[0\]\.path is required/,
+  );
+  assert.throws(
+    () => runKvmVm({ kernelPath: "vmlinux", rootfsPath: "rootfs.ext4", cmdline: "", memMiB: 1 }),
+    /cmdline is required/,
+  );
+  assert.throws(
+    () => runKvmVm({ kernelPath: "vmlinux", rootfsPath: "rootfs.ext4", cmdline: "console=ttyS0", memMiB: 1, cpus: 0 }),
+    /cpus must be between 1 and 64/,
+  );
+  assert.throws(
+    () =>
+      runKvmVm({
+        kernelPath: "vmlinux",
+        rootfsPath: "rootfs.ext4",
+        cmdline: "console=ttyS0",
+        memMiB: 1,
+        netTapName: "tap0",
+      }),
+    /netGuestMac is required/,
+  );
 });
 
 test("runKvmVmAsync forwards native validation errors from a worker", async () => {
@@ -791,6 +981,29 @@ test("runKvmVmAsync forwards native validation errors from a worker", async () =
   await assert.rejects(
     () => runKvmVmAsync({ kernelPath: "", rootfsPath: "", cmdline: "", memMiB: 1 }, { signal: controller.signal }),
     /aborted/,
+  );
+  await assert.rejects(
+    () =>
+      runKvmVmAsync({
+        kernelPath: "missing-kernel.elf",
+        rootfsPath: "missing-rootfs.ext4",
+        cmdline: "console=ttyS0",
+        memMiB: 1,
+      }),
+    (err: unknown) => err instanceof Error,
+  );
+  await assert.rejects(
+    () =>
+      runKvmVmAsync(
+        {
+          kernelPath: "missing-kernel.elf",
+          rootfsPath: "missing-rootfs.ext4",
+          cmdline: "console=ttyS0",
+          memMiB: 1,
+        },
+        { signal: new AbortController().signal },
+      ),
+    (err: unknown) => err instanceof Error,
   );
 });
 
@@ -818,7 +1031,7 @@ test("buildRootfs reports permission paths", async () => {
         tempDir: os.tmpdir(),
         cacheDir: os.tmpdir(),
       }),
-    /requires root/,
+    /requires root|requires Linux host|Dockerfile and repo builds still require Linux/,
   );
 
   await assert.rejects(
@@ -828,7 +1041,7 @@ test("buildRootfs reports permission paths", async () => {
         image: undefined,
         cacheDir: os.tmpdir(),
       }),
-    /requires root|build requires --image/,
+    /requires root|requires Linux host|build requires --image/,
   );
 });
 
@@ -837,4 +1050,409 @@ test("temporary cleanup works for explicit directories", async () => {
   await writeFile(path.join(dir, "x"), "x");
   await rm(dir, { recursive: true, force: true });
   assert.equal(await pathExists(dir), false);
+});
+
+// Track D.2.a — prebuilt rootfs slug mapping must stay in sync with
+// the GitHub Actions workflow that publishes the assets. If the slugs
+// drift, the client-side fetch in buildOrReuseRootfs silently 404s and
+// the WSL2 fallback runs instead — which is what we're trying to avoid.
+test("prebuiltSlugForImage maps the published images and rejects others", async () => {
+  const mod = await import("../src/prebuilt-rootfs.js");
+  assert.equal(mod.prebuiltSlugForImage("alpine:3.20"), "alpine-3.20");
+  assert.equal(mod.prebuiltSlugForImage("node:20-alpine"), "node-20-alpine");
+  assert.equal(mod.prebuiltSlugForImage("node:22-alpine"), "node-22-alpine");
+  // Any other ref must return null so the caller falls back to the
+  // WSL2 build path. Case-insensitive match on input.
+  assert.equal(mod.prebuiltSlugForImage("Alpine:3.20"), "alpine-3.20");
+  assert.equal(mod.prebuiltSlugForImage("ubuntu:24.04"), null);
+  assert.equal(mod.prebuiltSlugForImage("alpine:edge"), null);
+});
+
+// Track D.2.a — silent fallback when the prebuilt isn't published. We
+// run tryFetchPrebuiltRootfs against a clearly-bogus repo so the fetch
+// 404s, then assert it returns { fetched: false } without throwing
+// (caller relies on this to fall through to the WSL2 build path).
+test("tryFetchPrebuiltRootfs returns fetched:false on missing release", async () => {
+  const mod = await import("../src/prebuilt-rootfs.js");
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "node-vmm-prebuilt-"));
+  try {
+    const dest = path.join(tmp, "out.ext4");
+    const result = await mod.tryFetchPrebuiltRootfs({
+      image: "alpine:3.20",
+      destPath: dest,
+      packageVersion: "0.0.0-does-not-exist",
+      repo: "misaelzapata/node-vmm-this-repo-does-not-exist-test",
+      // Abort fast so the test doesn't depend on real network timeouts.
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(result.fetched, false);
+    assert.ok(typeof result.reason === "string" && result.reason.length > 0);
+    assert.equal(await pathExists(dest), false, "must not leave a partial file behind");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prebuilt rootfs manifest validation accepts complete manifests and rejects bad metadata", async () => {
+  const mod = await import("../src/prebuilt-rootfs.js");
+  const manifest = {
+    kind: mod.PREBUILT_ROOTFS_MANIFEST_KIND,
+    version: mod.PREBUILT_ROOTFS_MANIFEST_VERSION,
+    image: "alpine:3.20",
+    slug: "alpine-3.20",
+    diskMiB: 256,
+    platform: "linux",
+    arch: "x86_64",
+    createdAt: "2026-05-02T00:00:00.000Z",
+    rootfs: { name: "alpine-3.20.ext4", sizeBytes: 16, sha256: "a".repeat(64) },
+    gzip: { name: "alpine-3.20.ext4.gz", sizeBytes: 32, sha256: "b".repeat(64) },
+  };
+  assert.deepEqual(mod.validatePrebuiltRootfsManifest(manifest), manifest);
+  assert.throws(
+    () => mod.validatePrebuiltRootfsManifest({ ...manifest, gzip: { ...manifest.gzip, sha256: "not-a-sha" } }),
+    /manifest gzip\.sha256 is invalid/,
+  );
+  assert.throws(
+    () => mod.validatePrebuiltRootfsManifest({ ...manifest, rootfs: { ...manifest.rootfs, name: "../rootfs.ext4" } }),
+    /bad rootfs\.name asset name/,
+  );
+});
+
+test("tryFetchPrebuiltRootfs downloads and verifies a mocked manifest asset", async () => {
+  const mod = await import("../src/prebuilt-rootfs.js");
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "node-vmm-prebuilt-ok-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const dest = path.join(tmp, "out.ext4");
+    const rootfs = Buffer.from("mock-ext4-rootfs");
+    const compressed = gzipSync(rootfs);
+    const rootfsSha = createHash("sha256").update(rootfs).digest("hex");
+    const gzipSha = createHash("sha256").update(compressed).digest("hex");
+    const manifest = {
+      kind: mod.PREBUILT_ROOTFS_MANIFEST_KIND,
+      version: mod.PREBUILT_ROOTFS_MANIFEST_VERSION,
+      image: "alpine:3.20",
+      slug: "alpine-3.20",
+      diskMiB: 256,
+      platform: "linux",
+      arch: "x86_64",
+      createdAt: "2026-05-02T00:00:00.000Z",
+      rootfs: { name: "alpine-3.20.ext4", sizeBytes: rootfs.byteLength, sha256: rootfsSha },
+      gzip: { name: "alpine-3.20.ext4.gz", sizeBytes: compressed.byteLength, sha256: gzipSha },
+    };
+    const urls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith(".manifest.json")) {
+        return new Response(JSON.stringify(manifest), { headers: { "content-type": "application/json" } });
+      }
+      if (url.endsWith(".gz")) {
+        return new Response(new Uint8Array(compressed));
+      }
+      return new Response("missing", { status: 404, statusText: "Not Found" });
+    }) as typeof fetch;
+
+    const result = await mod.tryFetchPrebuiltRootfs({
+      image: "alpine:3.20",
+      destPath: dest,
+      packageVersion: "1.2.3",
+      repo: "owner/repo",
+    });
+
+    assert.equal(result.fetched, true);
+    assert.equal(await readFile(dest, "utf8"), "mock-ext4-rootfs");
+    assert.deepEqual(
+      urls.map((url) => new URL(url).pathname),
+      [
+        "/owner/repo/releases/download/v1.2.3/alpine-3.20.ext4.manifest.json",
+        "/owner/repo/releases/download/v1.2.3/alpine-3.20.ext4.gz",
+      ],
+    );
+    assert.equal(result.manifest?.slug, "alpine-3.20");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("tryFetchPrebuiltRootfs removes partial files on manifest checksum failure", async () => {
+  const mod = await import("../src/prebuilt-rootfs.js");
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "node-vmm-prebuilt-bad-sha-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const dest = path.join(tmp, "out.ext4");
+    const rootfs = Buffer.from("tampered-rootfs");
+    const compressed = gzipSync(rootfs);
+    const gzipSha = createHash("sha256").update(compressed).digest("hex");
+    const manifest = {
+      kind: mod.PREBUILT_ROOTFS_MANIFEST_KIND,
+      version: mod.PREBUILT_ROOTFS_MANIFEST_VERSION,
+      image: "alpine:3.20",
+      slug: "alpine-3.20",
+      diskMiB: 256,
+      platform: "linux",
+      arch: "x86_64",
+      createdAt: "2026-05-02T00:00:00.000Z",
+      rootfs: { name: "alpine-3.20.ext4", sizeBytes: rootfs.byteLength, sha256: "0".repeat(64) },
+      gzip: { name: "alpine-3.20.ext4.gz", sizeBytes: compressed.byteLength, sha256: gzipSha },
+    };
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url.endsWith(".manifest.json")) {
+        return new Response(JSON.stringify(manifest), { headers: { "content-type": "application/json" } });
+      }
+      if (url.endsWith(".gz")) {
+        return new Response(new Uint8Array(compressed));
+      }
+      return new Response("missing", { status: 404, statusText: "Not Found" });
+    }) as typeof fetch;
+
+    const result = await mod.tryFetchPrebuiltRootfs({
+      image: "alpine:3.20",
+      destPath: dest,
+      packageVersion: "1.2.3",
+      repo: "owner/repo",
+    });
+
+    assert.equal(result.fetched, false);
+    assert.match(result.reason ?? "", /prebuilt rootfs checksum mismatch/);
+    assert.equal(await pathExists(dest), false, "bad prebuilt downloads must not leave partial disks");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("buildOrReuseRootfs rejects --prebuilt require before falling back to local build paths", async () => {
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-prebuilt-require-"));
+  try {
+    await assert.rejects(
+      () =>
+        buildOrReuseRootfs({
+          options: { image: "ubuntu:24.04", prebuilt: "require" } as never,
+          source: { contextDir: cacheDir },
+          output: path.join(cacheDir, "out.ext4"),
+          tempDir: cacheDir,
+          cacheDir,
+        }),
+      /no prebuilt rootfs is published for ubuntu:24\.04/,
+    );
+    await assert.rejects(
+      () =>
+        buildOrReuseRootfs({
+          options: { dockerfile: "Dockerfile", prebuilt: "require" } as never,
+          source: { contextDir: cacheDir, dockerfile: path.join(cacheDir, "Dockerfile") },
+          output: path.join(cacheDir, "out.ext4"),
+          tempDir: cacheDir,
+          cacheDir,
+        }),
+      /required prebuilt rootfs unavailable for this rootfs input/,
+    );
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI accepts root disk persistence flag shapes and validates contradictory choices", async () => {
+  const parsed = parseOptions(
+    [
+      "--prebuilt",
+      "require",
+      "--disk-path",
+      "data.ext4",
+      "--disk-size",
+      "64",
+      "--persist",
+      "app-cache",
+      "--reset",
+    ],
+    new Set(["reset"]),
+    new Set(["prebuilt", "disk-path", "disk-size", "persist"]),
+  );
+  assert.equal(stringOption(parsed, "prebuilt"), "require");
+  assert.equal(stringOption(parsed, "disk-path"), "data.ext4");
+  assert.equal(intOption(parsed, "disk-size", 0), 64);
+  assert.equal(stringOption(parsed, "persist"), "app-cache");
+  assert.equal(boolOption(parsed, "reset"), true);
+
+  await assert.rejects(
+    () =>
+      main([
+        "node",
+        "node-vmm",
+        "run",
+        "--rootfs",
+        "root.ext4",
+        "--kernel",
+        "vmlinux",
+        "--net",
+        "none",
+        "--disk-path",
+        "data.ext4",
+        "--disk-size",
+        "64",
+        "--persist",
+        "app-cache",
+      ]),
+    /--persist.*diskPath|--persist.*--disk/i,
+  );
+  await assert.rejects(
+    () =>
+      main([
+        "node",
+        "node-vmm",
+        "run",
+        "--image",
+        "alpine:3.20",
+        "--kernel",
+        "vmlinux",
+        "--net",
+        "none",
+        "--reset",
+      ]),
+    /--reset requires --persist or --disk PATH/,
+  );
+  await assert.rejects(
+    () =>
+      main([
+        "node",
+        "node-vmm",
+        "run",
+        "--rootfs",
+        "root.ext4",
+        "--kernel",
+        "vmlinux",
+        "--net",
+        "none",
+        "--disk-size",
+        "0",
+      ]),
+    /--disk-size must be at least 1 MiB/,
+  );
+  await assert.rejects(
+    () =>
+      main([
+        "node",
+        "node-vmm",
+        "run",
+        "--rootfs",
+        "root.ext4",
+        "--kernel",
+        "vmlinux",
+        "--net",
+        "none",
+        "--disk",
+        "0",
+      ]),
+    /--disk must be at least 1 MiB/,
+  );
+});
+
+test("SDK validates attachDisks shape before native runtime setup", () => {
+  const whp = capabilitiesForHost({ platform: "win32", arch: "x64" });
+  assert.doesNotThrow(() =>
+    validateVmOptionsForCapabilities(
+      { network: "none", attachDisks: [{ path: "data.ext4" }, { path: "logs.ext4", readonly: true }] } as never,
+      whp,
+    ),
+  );
+  assert.throws(
+    () =>
+      validateVmOptionsForCapabilities(
+        { network: "none", attachDisks: [{ path: "" }] } as never,
+        whp,
+      ),
+    /attachDisks\[0\]\.path is required/,
+  );
+  assert.throws(
+    () =>
+      validateVmOptionsForCapabilities(
+        { network: "none", attachDisks: Array.from({ length: 17 }, (_value, index) => ({ path: `disk-${index}.ext4` })) } as never,
+        whp,
+      ),
+    /up to 16 attached data disks/,
+  );
+});
+
+// Track D.1 regression: on rootfs cache hits, buildOrReuseRootfs must
+// return early without calling buildRootfs (which on Windows is the
+// WSL2-driven path). Hitting the cache is the contract that lets
+// `node-vmm run --image alpine:3.20` re-run on Windows after the first
+// build without spawning WSL2 a second time.
+test("buildOrReuseRootfs cache hit returns the cached path without rebuilding (no WSL2 spawn)", async () => {
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-cache-hit-"));
+  try {
+    const options = {
+      image: "alpine:3.20",
+      diskMiB: 256,
+      buildArgs: {},
+      env: {},
+    };
+    const key = rootfsCacheKey(options as Parameters<typeof rootfsCacheKey>[0]);
+    const rootfsCacheRoot = path.join(cacheDir, "rootfs");
+    await mkdir(rootfsCacheRoot, { recursive: true, mode: 0o700 });
+    const cachedFile = path.join(rootfsCacheRoot, `${key}.ext4`);
+    await writeFile(cachedFile, "fake-rootfs", { mode: 0o600 });
+
+    let buildLogged = false;
+    const result = await buildOrReuseRootfs({
+      options: options as Parameters<typeof buildOrReuseRootfs>[0]["options"],
+      source: { contextDir: cacheDir },
+      output: path.join(cacheDir, "should-not-be-written.ext4"),
+      tempDir: cacheDir,
+      cacheDir,
+      logger: (message) => {
+        if (/cache miss|cache build/i.test(message)) {
+          buildLogged = true;
+        }
+      },
+    });
+
+    assert.equal(result.fromCache, true);
+    assert.equal(result.built, false);
+    assert.equal(result.rootfsPath, cachedFile);
+    assert.equal(buildLogged, false, "build path must not log on cache hit");
+    // Output path should NOT have been written; the cache file is reused
+    // verbatim. If it had, the WSL2 path would have run.
+    assert.equal(await pathExists(path.join(cacheDir, "should-not-be-written.ext4")), false);
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+// Track D.1 regression: `runImage --rootfs PATH` (no --image) must not
+// even consider the build pipeline, regardless of platform. This test
+// goes through the full validation/runImage path with a synthetic
+// rootfs file but a clearly-invalid kernel, so we know it bails *before*
+// any potential build call. Any WSL2 spawn would have shown up first.
+test("runImage with --rootfs never enters the build pipeline", async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "node-vmm-rootfs-direct-"));
+  try {
+    const fakeRootfs = path.join(tmp, "fake.ext4");
+    await writeFile(fakeRootfs, "fake-rootfs", { mode: 0o600 });
+    // No --image, no kernel: runImage will fail to resolve a kernel before
+    // it can possibly invoke the build pipeline. The shape of the error
+    // tells us which code path was taken: anything mentioning "wsl",
+    // "mkfs", or "buildRootfs" would indicate the contract is broken.
+    let err: unknown;
+    try {
+      await runImage(
+        {
+          rootfsPath: fakeRootfs,
+          kernelPath: path.join(tmp, "no-such-kernel"),
+        } as Parameters<typeof runImage>[0],
+        { cwd: tmp },
+      );
+    } catch (e) {
+      err = e;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    assert.ok(err, "runImage with --rootfs and missing kernel must error");
+    assert.doesNotMatch(message, /wsl/i, `unexpected WSL2 reference: ${message}`);
+    assert.doesNotMatch(message, /mkfs|truncate/i, `unexpected build pipeline reference: ${message}`);
+    assert.doesNotMatch(message, /buildRootfs/i, `unexpected build pipeline reference: ${message}`);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
 });

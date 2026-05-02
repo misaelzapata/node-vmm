@@ -1,0 +1,15 @@
+{
+  "name": "node-vmm-native",
+  "version-string": "0.1.3",
+  "description": "Native dependencies for the node-vmm WHP backend on Windows.",
+  "dependencies": [
+    {
+      "name": "libslirp",
+      "platform": "windows"
+    },
+    {
+      "name": "glib",
+      "platform": "windows"
+    }
+  ]
+}

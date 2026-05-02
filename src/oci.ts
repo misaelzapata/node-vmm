@@ -154,6 +154,14 @@ function parseBearerChallenge(header: string | null): Record<string, string> | n
   return params;
 }
 
+interface BlobDownloadProgress {
+  downloaded: number;
+  total?: number;
+  done: boolean;
+}
+
+type BlobDownloadProgressCallback = (progress: BlobDownloadProgress) => void;
+
 class RegistryClient {
   private token = "";
 
@@ -164,7 +172,11 @@ class RegistryClient {
     return (await response.json()) as T;
   }
 
-  async downloadBlob(descriptor: Descriptor, output: string): Promise<void> {
+  async downloadBlob(
+    descriptor: Descriptor,
+    output: string,
+    progress?: BlobDownloadProgressCallback,
+  ): Promise<void> {
     const maxBytes = ociByteLimit(OCI_MAX_BLOB_BYTES_ENV, DEFAULT_OCI_MAX_BLOB_BYTES);
     if (descriptor.size !== undefined && descriptor.size > maxBytes) {
       throw new NodeVmmError(`OCI blob is too large: ${descriptor.digest} ${descriptor.size} bytes exceeds ${maxBytes}`);
@@ -177,11 +189,16 @@ class RegistryClient {
     if (contentLength !== undefined && contentLength > maxBytes) {
       throw new NodeVmmError(`OCI blob is too large: ${descriptor.digest} ${contentLength} bytes exceeds ${maxBytes}`);
     }
+    const total = contentLength ?? descriptor.size;
+    const progressTransform = progress ? new BlobProgressTransform(total, progress) : undefined;
+    progress?.({ downloaded: 0, total, done: false });
     await pipeline(
       Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
       new ByteLimitTransform(maxBytes, `OCI blob ${descriptor.digest}`),
+      ...(progressTransform ? [progressTransform] : []),
       createWriteStream(output),
     );
+    progress?.({ downloaded: progressTransform?.bytes ?? contentLength ?? descriptor.size ?? 0, total, done: true });
   }
 
   private async fetchAuthorized(apiPath: string, accept: string): Promise<Response> {
@@ -275,6 +292,34 @@ class ByteLimitTransform extends Transform {
   }
 }
 
+class BlobProgressTransform extends Transform {
+  private downloaded = 0;
+  private lastReportBytes = 0;
+  private lastReportMs = Date.now();
+
+  constructor(private readonly total: number | undefined, private readonly progress: BlobDownloadProgressCallback) {
+    super();
+  }
+
+  get bytes(): number {
+    return this.downloaded;
+  }
+
+  override _transform(chunk: Buffer, encoding: BufferEncoding, callback: TransformCallback): void {
+    this.downloaded += chunk.byteLength;
+    const now = Date.now();
+    if (
+      now - this.lastReportMs >= 1000 ||
+      this.downloaded - this.lastReportBytes >= 8 * 1024 * 1024
+    ) {
+      this.lastReportMs = now;
+      this.lastReportBytes = this.downloaded;
+      this.progress({ downloaded: this.downloaded, total: this.total, done: false });
+    }
+    callback(null, chunk);
+  }
+}
+
 function ociByteLimit(envName: string, fallback: number): number {
   const raw = process.env[envName];
   if (!raw) {
@@ -357,6 +402,51 @@ async function verifyDigestFile(file: string, digest: string): Promise<void> {
   }
 }
 
+function formatOciBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || value >= 10 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+function formatOciDownloadProgress(progress: BlobDownloadProgress): string {
+  if (progress.total !== undefined && progress.total > 0) {
+    const percent = Math.min(100, Math.floor((progress.downloaded / progress.total) * 100));
+    return `${formatOciBytes(progress.downloaded)} / ${formatOciBytes(progress.total)} (${percent}%)`;
+  }
+  return formatOciBytes(progress.downloaded);
+}
+
+function createBlobProgressReporter(descriptor: Descriptor): BlobDownloadProgressCallback {
+  const digest = descriptor.digest.slice(0, 19);
+  let started = false;
+  let lastText = "";
+  return (progress) => {
+    const text = formatOciDownloadProgress(progress);
+    if (progress.done) {
+      if (text !== lastText) {
+        process.stdout.write(`[oci]     downloaded ${digest} ${text}\n`);
+      }
+      return;
+    }
+    if (!started) {
+      started = true;
+      const totalText = progress.total !== undefined ? ` (${formatOciBytes(progress.total)})` : "";
+      process.stdout.write(`[oci]     downloading ${digest}${totalText}\n`);
+      return;
+    }
+    if (text !== lastText) {
+      lastText = text;
+      process.stdout.write(`[oci]     downloaded ${digest} ${text}\n`);
+    }
+  };
+}
+
 async function downloadBlobCached(client: RegistryClient, cacheDir: string, descriptor: Descriptor): Promise<string> {
   const output = await cachedBlobPath(cacheDir, descriptor.digest);
   if (await pathExists(output)) {
@@ -365,7 +455,7 @@ async function downloadBlobCached(client: RegistryClient, cacheDir: string, desc
   }
   const tmp = `${output}.tmp-${process.pid}`;
   try {
-    await client.downloadBlob(descriptor, tmp);
+    await client.downloadBlob(descriptor, tmp, createBlobProgressReporter(descriptor));
     await verifyDigestFile(tmp, descriptor.digest);
     await rename(tmp, output);
   } catch (error) {

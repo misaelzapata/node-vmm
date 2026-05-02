@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -28,123 +29,346 @@ const EMPTY_IMAGE_CONFIG: ImageConfig = {
   labels: {},
 };
 const DEFAULT_DOCKERFILE_RUN_TIMEOUT_MS = 300_000;
+const OCI_MAX_EXTRACT_BYTES_ENV = "NODE_VMM_OCI_MAX_EXTRACT_BYTES";
+const DEFAULT_OCI_MAX_EXTRACT_BYTES = 8 * 1024 * 1024 * 1024;
+
+const WSL_OCI_EXTRACT_SCRIPT = String.raw`
+import os
+import posixpath
+import shutil
+import stat
+import sys
+import tarfile
+
+layer_path = sys.argv[1]
+root = os.path.realpath(sys.argv[2])
+max_bytes = int(sys.argv[3])
+total = 0
+
+def clean_entry(name):
+    cleaned = posixpath.normpath("/" + name.strip()).lstrip("/")
+    if cleaned in ("", "."):
+        return None
+    parts = cleaned.split("/")
+    if any(part == ".." for part in parts):
+        raise RuntimeError("layer entry escapes rootfs: " + name)
+    return cleaned
+
+def inside_root(path):
+    real = os.path.realpath(path)
+    if real != root and not real.startswith(root + os.sep):
+        raise RuntimeError("layer path resolves outside rootfs: " + path)
+    return real
+
+def target_for(rel):
+    return os.path.join(root, *rel.split("/"))
+
+def parent_inside(path):
+    parent = inside_root(os.path.dirname(path))
+    os.makedirs(parent, exist_ok=True)
+    return parent
+
+def remove_path(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+def safe_mode(member):
+    return (member.mode or 0o755) & ~0o6000
+
+def repair_link(rel, link):
+    if not link.startswith("/"):
+        return link
+    parent = posixpath.dirname("/" + rel)
+    repaired = posixpath.relpath(posixpath.normpath(link), parent)
+    return "." if repaired == "" else repaired
+
+with tarfile.open(layer_path, "r:*") as archive:
+    members = archive.getmembers()
+
+    for member in members:
+        rel = clean_entry(member.name)
+        if not rel:
+            continue
+        base = posixpath.basename(rel)
+        if not base.startswith(".wh."):
+            continue
+        parent_rel = posixpath.dirname(rel)
+        parent = target_for(parent_rel) if parent_rel and parent_rel != "." else root
+        if not os.path.isdir(parent):
+            continue
+        parent = inside_root(parent)
+        if base == ".wh..wh..opq":
+            for child in os.listdir(parent):
+                remove_path(os.path.join(parent, child))
+        else:
+            victim = inside_root(os.path.join(parent, base[len(".wh."):]))
+            if os.path.lexists(victim):
+                remove_path(victim)
+
+    for member in members:
+        rel = clean_entry(member.name)
+        if not rel:
+            continue
+        if posixpath.basename(rel).startswith(".wh."):
+            continue
+        if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+            raise RuntimeError("OCI layer entry type is not allowed: " + member.name)
+        total += member.size or 0
+        if total > max_bytes:
+            raise RuntimeError("OCI layer extraction is too large: exceeds " + str(max_bytes) + " bytes")
+
+        target = target_for(rel)
+        parent_inside(target)
+        if member.isdir():
+            if os.path.lexists(target) and not os.path.isdir(target):
+                remove_path(target)
+            os.makedirs(target, exist_ok=True)
+            os.chmod(target, safe_mode(member))
+        elif member.issym():
+            if os.path.lexists(target):
+                remove_path(target)
+            os.symlink(repair_link(rel, member.linkname or ""), target)
+        elif member.islnk():
+            link = member.linkname or ""
+            if link.startswith("/") or ".." in posixpath.normpath(link).split("/"):
+                raise RuntimeError("OCI hardlink target is not allowed: " + member.name + " -> " + link)
+            source = inside_root(target_for(clean_entry(link) or ""))
+            if os.path.lexists(target):
+                remove_path(target)
+            os.link(source, target)
+        else:
+            if os.path.lexists(target):
+                remove_path(target)
+            with archive.extractfile(member) as source, open(target, "wb") as dest:
+                if source is None:
+                    raise RuntimeError("could not read layer file: " + member.name)
+                shutil.copyfileobj(source, dest)
+            os.chmod(target, safe_mode(member))
+`;
+
+const WSL_WRITE_TEXT_SCRIPT = String.raw`
+import os
+import sys
+import tempfile
+
+target = sys.argv[1]
+mode = int(sys.argv[2], 8)
+parent = os.path.dirname(target)
+os.makedirs(parent, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".node-vmm.", dir=parent)
+try:
+    with os.fdopen(fd, "wb") as out:
+        out.write(sys.stdin.buffer.read())
+    os.chmod(tmp, mode)
+    os.replace(tmp, target)
+    os.chmod(target, mode)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+`;
+
+function renderInteractiveLoginScript(): string {
+  return `  node_vmm_login=/tmp/node-vmm-login
+cat > "$node_vmm_login" <<'NODE_VMM_LOGIN'
+#!/bin/sh
+: > /tmp/node-vmm-login-started 2>/dev/null || true
+if [ -n "$NODE_VMM_TTY_ROWS" ] && [ -n "$NODE_VMM_TTY_COLS" ]; then
+  stty rows "$NODE_VMM_TTY_ROWS" cols "$NODE_VMM_TTY_COLS" 2>/dev/null || true
+  export LINES="$NODE_VMM_TTY_ROWS"
+  export COLUMNS="$NODE_VMM_TTY_COLS"
+fi
+case "$NODE_VMM_COMMAND" in
+  /bin/sh|sh|"")
+    exec /bin/sh -i
+    ;;
+  *)
+    exec /bin/sh -lc "$NODE_VMM_COMMAND"
+    ;;
+esac
+NODE_VMM_LOGIN
+  chmod +x "$node_vmm_login" 2>/dev/null || true
+`;
+}
+
+function renderWindowsConsoleInteractiveBlock(): string {
+  return `  node_vmm_apply_tty_size() {
+    case "$NODE_VMM_TTY_ROWS:$NODE_VMM_TTY_COLS" in
+      *[!0-9:]*|:|*:|:*) return ;;
+    esac
+    stty -F "$1" rows "$NODE_VMM_TTY_ROWS" cols "$NODE_VMM_TTY_COLS" 2>/dev/null || true
+  }
+  if [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && command -v getty >/dev/null 2>&1; then
+    node_vmm_log "[node-vmm] interactive: using getty"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_getty_status=0
+    getty -L -n -l "$node_vmm_login" 115200 ttyS0 xterm-256color || node_vmm_getty_status=$?
+    if [ "$node_vmm_getty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] getty failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_getty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && command -v agetty >/dev/null 2>&1; then
+    node_vmm_log "[node-vmm] interactive: using agetty"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_getty_status=0
+    agetty -L -n -l "$node_vmm_login" ttyS0 115200 xterm-256color || node_vmm_getty_status=$?
+    if [ "$node_vmm_getty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] agetty failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_getty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && [ -x /node-vmm/console ] && [ -c /dev/ttyS0 ]; then
+    node_vmm_log "[node-vmm] interactive: using ttyS0"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_tty_status=0
+    /node-vmm/console --tty /dev/ttyS0 "$node_vmm_login" || node_vmm_tty_status=$?
+    if [ "$node_vmm_tty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] ttyS0 failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_tty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ -x /node-vmm/console ]; then
+    node_vmm_log "[node-vmm] interactive: using pty helper"
+    /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+`;
+}
+
+function renderLinuxPtyInteractiveBlock(): string {
+  return `  elif [ -x /node-vmm/console ]; then
+    case "$NODE_VMM_COMMAND" in
+      /bin/sh|sh|"")
+        /node-vmm/console /bin/sh -i 2>/node-vmm/console.err
+        node_vmm_log "[node-vmm] shim returned rc=$?"
+        if [ -s /node-vmm/console.err ]; then
+          node_vmm_log "[node-vmm] shim stderr:"
+          node_vmm_cat_console /node-vmm/console.err
+        fi
+        ;;
+      *)
+        /node-vmm/console /bin/sh -lc "$NODE_VMM_COMMAND" 2>/node-vmm/console.err
+        ;;
+    esac
+`;
+}
+
+function renderFallbackInteractiveBlock(): string {
+  return `  else
+    case "$NODE_VMM_COMMAND" in
+      /bin/sh|sh|"")
+        /bin/sh -i
+        ;;
+      *)
+        /bin/sh -lc "$NODE_VMM_COMMAND"
+        ;;
+    esac
+  fi
+`;
+}
 
 export function renderInitScript(options: {
   commandLine: string;
   workdir: string;
   mode?: "batch" | "interactive";
 }): string {
+  // The init script ships both batch and interactive run-blocks; the actual
+  // mode is picked up from NODE_VMM_INTERACTIVE on the kernel cmdline so the
+  // same rootfs can be reused across `--interactive` and `--cmd` invocations.
   const command = shellQuote(options.commandLine);
   const workdir = shellQuote(options.workdir);
-  const interactive = options.mode === "interactive";
-  const runBlock = interactive
-    ? `node_vmm_log "[node-vmm] interactive: $NODE_VMM_COMMAND"
-if [ -x /node-vmm/console ]; then
-  /node-vmm/console /bin/sh -lc "$NODE_VMM_COMMAND" 2>/node-vmm/console.err
+  const runBlock = `if [ "$NODE_VMM_INTERACTIVE" = "1" ]; then
+  node_vmm_log "[node-vmm] interactive: $NODE_VMM_COMMAND"
+  export NODE_VMM_COMMAND
+  # The PTY shim execs argv[1..] verbatim. We MUST exec something that stays
+  # alive on a fresh tty: 'sh -lc cmd' hands its stdin to the wrapper and the
+  # inner shell exits with status 0 (no -i, no input pending). When the user
+  # asked for the default interactive shell, exec '/bin/sh -i' so the shell
+  # blocks on read. Otherwise honour the explicit command (htop, vim, etc).
+${renderInteractiveLoginScript()}${renderWindowsConsoleInteractiveBlock()}${renderLinuxPtyInteractiveBlock()}${renderFallbackInteractiveBlock()}  # End backend-specific interactive console selection.
+  status=$?
+  printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
+  node_vmm_log "[node-vmm] command exited with status $status"
 else
-  /bin/sh -lc "$NODE_VMM_COMMAND"
-fi
-status=$?
-printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
-node_vmm_log "[node-vmm] command exited with status $status"
-`
-    : `node_vmm_log "[node-vmm] running: $NODE_VMM_COMMAND"
-/bin/sh -lc "$NODE_VMM_COMMAND" >/tmp/node-vmm-command.out 2>&1
-status=$?
-cp /tmp/node-vmm-command.out /node-vmm/command.out 2>/dev/null || true
-printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
-if [ -f /tmp/node-vmm-command.out ]; then
-  node_vmm_cat_console /tmp/node-vmm-command.out
-  if [ -s /tmp/node-vmm-command.out ]; then
-    last_byte="$(tail -c 1 /tmp/node-vmm-command.out 2>/dev/null || true)"
-    if [ -n "$last_byte" ]; then
-      node_vmm_console ""
+  node_vmm_log "[node-vmm] running: $NODE_VMM_COMMAND"
+  /bin/sh -lc "$NODE_VMM_COMMAND" >/tmp/node-vmm-command.out 2>&1
+  status=$?
+  cp /tmp/node-vmm-command.out /node-vmm/command.out 2>/dev/null || true
+  printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
+  if [ -f /tmp/node-vmm-command.out ]; then
+    node_vmm_cat_console /tmp/node-vmm-command.out
+    if [ -s /tmp/node-vmm-command.out ]; then
+      last_byte="$(tail -c 1 /tmp/node-vmm-command.out 2>/dev/null || true)"
+      if [ -n "$last_byte" ]; then
+        node_vmm_console ""
+      fi
     fi
   fi
+  node_vmm_log "[node-vmm] command exited with status $status"
 fi
-node_vmm_log "[node-vmm] command exited with status $status"
 `;
+  void options.mode;
   return `#!/bin/sh
 set +e
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-NODE_VMM_INTERACTIVE=${interactive ? "1" : "0"}
+NODE_VMM_INTERACTIVE=0
 
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-mkdir -p /dev
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || true
-mkdir -p /dev/pts /dev/shm /run /tmp
-if [ -e /dev/console ] && [ ! -c /dev/console ]; then
-  rm -f /dev/console 2>/dev/null || true
-fi
-if [ ! -c /dev/console ]; then
-  mknod /dev/console c 5 1 2>/dev/null || true
-fi
-if [ -e /dev/ttyS0 ] && [ ! -c /dev/ttyS0 ]; then
-  rm -f /dev/ttyS0 2>/dev/null || true
-fi
-if [ ! -c /dev/ttyS0 ]; then
-  mknod /dev/ttyS0 c 4 64 2>/dev/null || true
-fi
-if [ -e /dev/null ] && [ ! -c /dev/null ]; then
-  rm -f /dev/null 2>/dev/null || true
-fi
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# devtmpfs (CONFIG_DEVTMPFS in our kernel) auto-creates /dev/{console,ttyS0,
+# null,zero,random,urandom,port,...}. Only fall back to manual mknod if
+# devtmpfs failed (tmpfs fallback path).
 if [ ! -c /dev/null ]; then
-  mknod /dev/null c 1 3 2>/dev/null || true
+  mount -t tmpfs tmpfs /dev 2>/dev/null
+  for entry in console:5:1 ttyS0:4:64 null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 port:1:4; do
+    name=\${entry%%:*}; rest=\${entry#*:}; major=\${rest%%:*}; minor=\${rest#*:}
+    mknod "/dev/$name" c "$major" "$minor" 2>/dev/null
+  done
 fi
-if [ -e /dev/zero ] && [ ! -c /dev/zero ]; then
-  rm -f /dev/zero 2>/dev/null || true
-fi
-if [ ! -c /dev/zero ]; then
-  mknod /dev/zero c 1 5 2>/dev/null || true
-fi
-if [ -e /dev/full ] && [ ! -c /dev/full ]; then
-  rm -f /dev/full 2>/dev/null || true
-fi
-if [ ! -c /dev/full ]; then
-  mknod /dev/full c 1 7 2>/dev/null || true
-fi
-if [ -e /dev/random ] && [ ! -c /dev/random ]; then
-  rm -f /dev/random 2>/dev/null || true
-fi
-if [ ! -c /dev/random ]; then
-  mknod /dev/random c 1 8 2>/dev/null || true
-fi
-if [ -e /dev/urandom ] && [ ! -c /dev/urandom ]; then
-  rm -f /dev/urandom 2>/dev/null || true
-fi
-if [ ! -c /dev/urandom ]; then
-  mknod /dev/urandom c 1 9 2>/dev/null || true
-fi
-if [ -e /dev/port ] && [ ! -c /dev/port ]; then
-  rm -f /dev/port 2>/dev/null || true
-fi
-if [ ! -c /dev/port ]; then
-  mknod /dev/port c 1 4 2>/dev/null || true
-fi
-chmod 600 /dev/console /dev/ttyS0 2>/dev/null || true
-chmod 666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom 2>/dev/null || true
-mount -t devpts devpts /dev/pts -o ptmxmode=0666,mode=0620 2>/dev/null || mount -t devpts devpts /dev/pts 2>/dev/null || true
-if [ ! -e /dev/ptmx ]; then
-  ln -s pts/ptmx /dev/ptmx 2>/dev/null || mknod /dev/ptmx c 5 2 2>/dev/null || true
-fi
-chmod 666 /dev/ptmx 2>/dev/null || true
-mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
-chmod 1777 /tmp 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts -o ptmxmode=0666,mode=0620 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+[ -e /dev/ptmx ] || ln -s pts/ptmx /dev/ptmx 2>/dev/null
+chmod 1777 /tmp 2>/dev/null
 NODE_VMM_CONSOLE=/dev/console
 NODE_VMM_FAST_EXIT=0
+NODE_VMM_RESIZE_ROOTFS=0
+NODE_VMM_WINDOWS_CONSOLE=0
 NODE_VMM_IFACE=
 NODE_VMM_ADDR=
 NODE_VMM_GW=
 NODE_VMM_RUNTIME_DNS=
+NODE_VMM_TTY_COLS=80
+NODE_VMM_TTY_ROWS=24
+NODE_VMM_WHP_CONSOLE_ROUTE=getty
 if [ -c /dev/ttyS0 ]; then
   NODE_VMM_CONSOLE=/dev/ttyS0
-fi
-if [ "$NODE_VMM_INTERACTIVE" != "1" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
-  exec </dev/null >"$NODE_VMM_CONSOLE" 2>&1
-elif [ "$NODE_VMM_INTERACTIVE" != "1" ]; then
-  exec </dev/null
 fi
 
 if [ -f /node-vmm/env ]; then
@@ -152,6 +376,9 @@ if [ -f /node-vmm/env ]; then
 fi
 
 NODE_VMM_COMMAND=${command}
+# Parse the kernel cmdline before any stdin/stdout redirect: the interactive
+# branch needs to see node_vmm.interactive=1 to leave fd 0 attached to the
+# serial console for the PTY helper.
 if [ -r /proc/cmdline ]; then
   for node_vmm_arg in $(cat /proc/cmdline); do
     case "$node_vmm_arg" in
@@ -164,6 +391,27 @@ if [ -r /proc/cmdline ]; then
         ;;
       node_vmm.fast_exit=1)
         NODE_VMM_FAST_EXIT=1
+        ;;
+      node_vmm.resize_rootfs=1)
+        NODE_VMM_RESIZE_ROOTFS=1
+        ;;
+      node_vmm.interactive=1)
+        NODE_VMM_INTERACTIVE=1
+        ;;
+      node_vmm.windows_console=1|node_vmm.getty=1)
+        NODE_VMM_WINDOWS_CONSOLE=1
+        ;;
+      node_vmm.console_route=pty)
+        NODE_VMM_WHP_CONSOLE_ROUTE=pty
+        ;;
+      node_vmm.console_route=getty)
+        NODE_VMM_WHP_CONSOLE_ROUTE=getty
+        ;;
+      node_vmm.tty_cols=*)
+        NODE_VMM_TTY_COLS=\${node_vmm_arg#node_vmm.tty_cols=}
+        ;;
+      node_vmm.tty_rows=*)
+        NODE_VMM_TTY_ROWS=\${node_vmm_arg#node_vmm.tty_rows=}
         ;;
       node_vmm.iface=*)
         NODE_VMM_IFACE=\${node_vmm_arg#node_vmm.iface=}
@@ -179,6 +427,14 @@ if [ -r /proc/cmdline ]; then
         ;;
     esac
   done
+fi
+
+export NODE_VMM_TTY_COLS NODE_VMM_TTY_ROWS
+
+if [ "$NODE_VMM_INTERACTIVE" != "1" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
+  exec </dev/null >"$NODE_VMM_CONSOLE" 2>&1
+elif [ "$NODE_VMM_INTERACTIVE" != "1" ]; then
+  exec </dev/null
 fi
 
 node_vmm_console() {
@@ -222,8 +478,11 @@ node_vmm_port_cat() {
 }
 
 node_vmm_exit_now() {
+  exit_status="$\{1:-0\}"
   if [ -c /dev/port ]; then
-    printf '\\000' | dd of=/dev/port bs=1 seek=1281 count=1 conv=notrunc 2>/dev/null
+    # IO port 0x501 (1281) is the node-vmm paravirt exit port. The status byte
+    # the host reads becomes the run result's "exitStatus".
+    printf "\\\\$(printf '%03o' "$exit_status")" | dd of=/dev/port bs=1 seek=1281 count=1 conv=notrunc 2>/dev/null
   fi
 }
 
@@ -234,6 +493,15 @@ fi
 if [ -n "$NODE_VMM_RUNTIME_DNS" ]; then
   mkdir -p /etc
   printf 'nameserver %s\\n' "$NODE_VMM_RUNTIME_DNS" > /etc/resolv.conf 2>/dev/null || true
+fi
+if [ "$NODE_VMM_RESIZE_ROOTFS" = "1" ] && command -v resize2fs >/dev/null 2>&1; then
+  resize2fs /dev/vda >/dev/null 2>&1 || true
+fi
+if command -v ip >/dev/null 2>&1; then
+  ip link set lo up 2>/dev/null || true
+  ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+else
+  ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null || true
 fi
 if [ -n "$NODE_VMM_IFACE" ] && [ -n "$NODE_VMM_ADDR" ]; then
   if command -v ip >/dev/null 2>&1; then
@@ -252,10 +520,14 @@ if [ -n "$NODE_VMM_IFACE" ] && [ -n "$NODE_VMM_ADDR" ]; then
 fi
 
 cd ${workdir} 2>/dev/null || cd /
-${runBlock}if [ "$NODE_VMM_FAST_EXIT" = "1" ]; then
-  node_vmm_exit_now
+${runBlock}if [ "$NODE_VMM_INTERACTIVE" = "1" ] || [ "$NODE_VMM_FAST_EXIT" = "1" ]; then
+  node_vmm_exit_now "$status"
 fi
 sync
+# Always signal a clean shutdown to the host through the paravirt exit port
+# before falling back to ACPI/reboot, so the runtime returns immediately
+# instead of timing out when the kernel can't actually power down.
+node_vmm_exit_now "$status"
 poweroff -f 2>/dev/null || reboot -f 2>/dev/null || true
 sync
 exit "$status"
@@ -287,12 +559,215 @@ function projectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 }
 
+function consoleHelperPrebuiltPath(): string | null {
+  const candidate = path.join(projectRoot(), "prebuilds", "linux-x64", "node-vmm-console");
+  if (existsSync(candidate)) {
+    const source = path.join(projectRoot(), "guest", "node-vmm-console.cc");
+    try {
+      if (statSync(candidate).mtimeMs >= statSync(source).mtimeMs) {
+        return candidate;
+      }
+    } catch {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 async function installConsoleHelper(mountDir: string, tempDir: string): Promise<void> {
+  const target = path.join(mountDir, "node-vmm", "console");
+  const prebuilt = consoleHelperPrebuiltPath();
+  if (prebuilt) {
+    await runCommand("install", ["-m", "0755", prebuilt, target]);
+    return;
+  }
   const helperSource = path.join(projectRoot(), "guest", "node-vmm-console.cc");
   const helperBin = path.join(tempDir, "node-vmm-console");
   await runCommand("g++", ["-static", "-Os", "-s", "-o", helperBin, helperSource, "-lutil"]);
-  const target = path.join(mountDir, "node-vmm", "console");
   await runCommand("install", ["-m", "0755", helperBin, target]);
+}
+
+function ociExtractByteLimit(): number {
+  const raw = process.env[OCI_MAX_EXTRACT_BYTES_ENV];
+  if (!raw) {
+    return DEFAULT_OCI_MAX_EXTRACT_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new NodeVmmError(`${OCI_MAX_EXTRACT_BYTES_ENV} must be a non-negative byte count`);
+  }
+  return parsed;
+}
+
+function windowsPathToWslPath(target: string): string {
+  const resolved = path.resolve(target);
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(resolved);
+  if (!match) {
+    throw new NodeVmmError(`WSL2 rootfs builder requires a local drive path, got: ${target}`);
+  }
+  return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
+}
+
+async function runWslRoot(script: string, options: Parameters<typeof runCommand>[2] = {}) {
+  return runCommand("wsl.exe", ["-u", "root", "sh", "-lc", script], options);
+}
+
+async function requireWslRootfsBuilder(options: RootfsBuildOptions): Promise<void> {
+  const required = ["truncate", "mkfs.ext4", "mount", "umount", "python3"];
+  if (!consoleHelperPrebuiltPath()) {
+    required.push("g++", "install");
+  }
+  const checks = required.map((command) => `command -v ${shellQuote(command)} >/dev/null`).join(" && ");
+  const result = await runWslRoot(checks, { capture: true, allowFailure: true, signal: options.signal });
+  if (result.code !== 0) {
+    const details = (result.stderr || result.stdout).trim();
+    throw new NodeVmmError(
+      `Windows rootfs builds require WSL2 with Linux filesystem tools (${required.join(", ")}).\n` +
+        (details ? `${details}\n` : "") +
+        `Install once as root in your WSL distro, e.g. on Debian/Ubuntu:\n` +
+        `  apt-get update && apt-get install -y ${required.join(" ")}`,
+    );
+  }
+}
+
+function wslBuildDir(): string {
+  const suffix = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `/tmp/node-vmm-build-${suffix}`;
+}
+
+async function mountWslRootfs(options: RootfsBuildOptions, wslBase: string, mountDir: string): Promise<void> {
+  const output = windowsPathToWslPath(options.output);
+  await runWslRoot(
+    [
+      "set -eu",
+      `mkdir -p ${shellQuote(wslBase)} ${shellQuote(mountDir)}`,
+      `truncate -s ${shellQuote(`${options.diskMiB}M`)} ${shellQuote(output)}`,
+      `mkfs.ext4 -q -F -L rootfs ${shellQuote(output)}`,
+      `mount -o loop ${shellQuote(output)} ${shellQuote(mountDir)}`,
+    ].join("\n"),
+    { signal: options.signal },
+  );
+}
+
+async function unmountWslRootfs(wslBase: string, mountDir: string): Promise<void> {
+  await runWslRoot(
+    [
+      "set +e",
+      "sync",
+      `umount ${shellQuote(mountDir)} 2>/dev/null || umount -l ${shellQuote(mountDir)} 2>/dev/null || true`,
+      `rm -rf -- ${shellQuote(wslBase)}`,
+    ].join("\n"),
+    { capture: true, allowFailure: true },
+  );
+}
+
+async function extractOciImageToWslMount(
+  image: Awaited<ReturnType<typeof pullOciImage>>,
+  mountDir: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  process.stdout.write(`[oci] extracting ${image.layers.length} layers to ${mountDir} through WSL2\n`);
+  const maxBytes = ociExtractByteLimit();
+  for (let index = 0; index < image.layers.length; index += 1) {
+    const layer = image.layers[index];
+    process.stdout.write(`[oci]   extracting ${index + 1}/${image.layers.length}\n`);
+    await runCommand(
+      "wsl.exe",
+      ["-u", "root", "python3", "-c", WSL_OCI_EXTRACT_SCRIPT, windowsPathToWslPath(layer.path), mountDir, String(maxBytes)],
+      { signal },
+    );
+  }
+}
+
+async function installWslText(target: string, content: string, mode: "0600" | "0755", signal?: AbortSignal): Promise<void> {
+  await runCommand("wsl.exe", ["-u", "root", "python3", "-c", WSL_WRITE_TEXT_SCRIPT, target, mode], {
+    input: content,
+    signal,
+  });
+}
+
+async function installWslConsoleHelper(mountDir: string, signal?: AbortSignal): Promise<void> {
+  const targetWsl = `${mountDir}/node-vmm/console`;
+  const prebuiltWindows = consoleHelperPrebuiltPath();
+  if (prebuiltWindows) {
+    const prebuiltWsl = windowsPathToWslPath(prebuiltWindows);
+    await runWslRoot(
+      `install -m 0755 ${shellQuote(prebuiltWsl)} ${shellQuote(targetWsl)}`,
+      { signal },
+    );
+    return;
+  }
+  // Compile once inside WSL2 and cache the artifact under
+  // prebuilds/linux-x64/node-vmm-console so subsequent rootfs builds (and
+  // the next npm publish) skip the compile step entirely.
+  const prebuildDir = path.join(projectRoot(), "prebuilds", "linux-x64");
+  await mkdir(prebuildDir, { recursive: true });
+  const cacheWindows = path.join(prebuildDir, "node-vmm-console");
+  const cacheWsl = windowsPathToWslPath(cacheWindows);
+  const helperSource = windowsPathToWslPath(path.join(projectRoot(), "guest", "node-vmm-console.cc"));
+  await runWslRoot(
+    [
+      "set -eu",
+      `g++ -static -Os -s -o ${shellQuote(cacheWsl)} ${shellQuote(helperSource)} -lutil`,
+      `install -m 0755 ${shellQuote(cacheWsl)} ${shellQuote(targetWsl)}`,
+    ].join("\n"),
+    { signal },
+  );
+}
+
+async function writeWslRootfsMetadata(
+  options: RootfsBuildOptions,
+  imageConfig: ImageConfig,
+  mountDir: string,
+): Promise<void> {
+  const nodeVmmDir = `${mountDir}/node-vmm`;
+  await runWslRoot(`mkdir -p ${shellQuote(nodeVmmDir)}`, { signal: options.signal });
+  await installWslText(`${nodeVmmDir}/env`, renderEnvFile(mergeEnv(imageConfig, options.env)), "0600", options.signal);
+  await installWslConsoleHelper(mountDir, options.signal);
+  const initScript = renderInitScript({
+    commandLine: commandLineFromImage(imageConfig, {
+      cmd: options.cmd,
+      entrypoint: options.entrypoint,
+    }),
+    workdir: workdirFromImage(imageConfig, options.workdir),
+    mode: options.initMode,
+  });
+  await installWslText(`${mountDir}/init`, initScript, "0755", options.signal);
+}
+
+async function buildRootfsWithWsl(options: RootfsBuildOptions): Promise<void> {
+  if (options.dockerfile) {
+    throw new NodeVmmError("Windows/WHP can build OCI image rootfs images through WSL2, but Dockerfile and repo builds still require Linux for now");
+  }
+  if (!options.image) {
+    throw new NodeVmmError("build requires --image on Windows/WHP");
+  }
+  await requireWslRootfsBuilder(options);
+
+  const wslBase = wslBuildDir();
+  const mountDir = `${wslBase}/mnt`;
+  let mounted = false;
+  try {
+    options.signal?.throwIfAborted();
+    await mountWslRootfs(options, wslBase, mountDir);
+    mounted = true;
+    const pulled = await pullOciImage({
+      image: options.image,
+      platformOS: "linux",
+      platformArch: options.platformArch || hostArchToOci(),
+      cacheDir: options.cacheDir,
+      signal: options.signal,
+    });
+    const imageConfig = pulled.config || EMPTY_IMAGE_CONFIG;
+    await extractOciImageToWslMount(pulled, mountDir, options.signal);
+    await writeWslRootfsMetadata(options, imageConfig, mountDir);
+  } finally {
+    if (mounted) {
+      await unmountWslRootfs(wslBase, mountDir);
+    } else {
+      await runWslRoot(`rm -rf -- ${shellQuote(wslBase)}`, { capture: true, allowFailure: true });
+    }
+  }
 }
 
 interface DockerfileStage {
@@ -842,6 +1317,10 @@ async function buildDockerfileRootfs(options: RootfsBuildOptions, mountDir: stri
 }
 
 export async function buildRootfs(options: RootfsBuildOptions): Promise<void> {
+  if (process.platform === "win32") {
+    await buildRootfsWithWsl(options);
+    return;
+  }
   requireRoot("building a rootfs image");
   const requiredCommands = ["truncate", "mkfs.ext4", "mount", "umount"];
   if (options.dockerfile) {
@@ -886,9 +1365,7 @@ export async function buildRootfs(options: RootfsBuildOptions): Promise<void> {
     await mkdir(nodeVmmDir, { recursive: true });
     const envFile = renderEnvFile(mergeEnv(imageConfig, options.env));
     await writeFile(path.join(nodeVmmDir, "env"), envFile, { mode: 0o600 });
-    if (options.initMode === "interactive") {
-      await installConsoleHelper(mountDir, options.tempDir);
-    }
+    await installConsoleHelper(mountDir, options.tempDir);
 
     const initScript = renderInitScript({
       commandLine: commandLineFromImage(imageConfig, {

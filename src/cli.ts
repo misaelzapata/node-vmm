@@ -10,12 +10,15 @@ import {
   runCode,
   type NetworkMode,
 } from "./index.js";
-import { boolOption, intOption, keyValueOption, parseOptions, stringListOption, stringOption } from "./args.js";
+import { boolOption, intOption, keyValueOption, parseOptions, stringListOption, stringOption, type ParsedArgs } from "./args.js";
+import { parsePrebuiltRootfsMode } from "./disk.js";
 import { fetchGocrackerKernel, requireKernelPath } from "./kernel.js";
 import { NodeVmmError } from "./utils.js";
 
-const BOOL_FLAGS = new Set(["help", "interactive", "wait", "restore", "sandbox", "keep-overlay", "fast-exit", "force"]);
+const BOOL_FLAGS = new Set(["help", "interactive", "wait", "restore", "sandbox", "keep-overlay", "fast-exit", "force", "reset"]);
 const VALUE_FLAGS = new Set([
+  "attach-disk",
+  "attach-disk-ro",
   "arch",
   "boot-args",
   "build-arg",
@@ -25,6 +28,8 @@ const VALUE_FLAGS = new Set([
   "code",
   "context",
   "disk",
+  "disk-path",
+  "disk-size",
   "disk-image",
   "dockerfile",
   "dockerfile-run-timeout-ms",
@@ -43,6 +48,8 @@ const VALUE_FLAGS = new Set([
   "overlay",
   "overlay-dir",
   "port",
+  "prebuilt",
+  "persist",
   "publish",
   "ref",
   "repo",
@@ -68,8 +75,8 @@ Commands:
   repo      Shortcut for build/run/code with a Git repository URL
   snapshot  Create or restore a core snapshot bundle
   kernel    Find or download the default guest kernel
-  features  Print supported KVM backend features
-  doctor    Check host dependencies
+  features  Print supported backend features
+  doctor    Report host dependencies and known limits
   version   Print version
 
 Run examples:
@@ -90,13 +97,21 @@ Common flags:
   --subdir DIR          repository subdirectory to use as build context
   --dockerfile-run-timeout-ms MS
                          max time for each Dockerfile RUN (default: 300000)
-  --disk PATH           rootfs size for build/run, or disk path for boot
+  --disk-size MIB      root disk size for build/run (preferred)
+  --disk-path PATH     explicit writable root disk path for run
+  --disk PATH|MIB      disk path for run/boot, or legacy numeric size for build/run
+  --prebuilt MODE      auto|off|require for release rootfs downloads (default: auto)
+  --persist NAME       create/reuse a cache-managed persistent root disk
+  --reset              recreate the persistent/explicit root disk from the selected image
+  --attach-disk PATH   attach an extra read-write raw disk as /dev/vdb, repeatable
+  --attach-disk-ro PATH
+                        attach an extra read-only raw disk, repeatable
   --output PATH         output rootfs path for build
   --cmd STRING          command to run in the guest via /bin/sh -lc
   --code STRING         source code for the code command
   --js STRING           JavaScript source alias for --code
   --language NAME       javascript|typescript|shell for the code command
-  --interactive         connect a terminal TTY; Ctrl-C stops the VM
+  --interactive         connect a terminal TTY; use exit or Ctrl-D to stop the VM
   --sandbox             restore-fast mode: write guest disk changes to a temp overlay
   --restore             alias for --sandbox
   --overlay PATH        explicit sparse overlay path for --sandbox
@@ -110,7 +125,8 @@ Common flags:
   --arch ARCH           OCI architecture (default: host arch)
   --mem MIB             guest memory (default: 256)
   --cpus N              vCPU count, 1-64 (default: 1)
-  --net auto|none|tap   network mode (default: auto)
+  --net auto|none|tap|slirp
+                        network mode (default: auto; WHP auto resolves to slirp)
   --tap NAME            existing/created TAP name for --net tap or auto
   -p, --publish SPEC    Docker-style TCP publish: [IP:]HOST:CONTAINER[/tcp]
   --port SPEC           alias for --publish, repeatable
@@ -161,16 +177,60 @@ function timeoutOption(parsed: ReturnType<typeof parseCommon>): number | undefin
   return parsed.values.has("timeout-ms") ? intOption(parsed, "timeout-ms", 60000) : undefined;
 }
 
-function networkOption(parsed: ReturnType<typeof parseCommon>): NetworkMode {
+export function networkOption(parsed: ParsedArgs): NetworkMode | undefined {
+  if (!parsed.values.has("net")) {
+    return undefined;
+  }
   const network = stringOption(parsed, "net", "auto");
-  if (!["auto", "none", "tap"].includes(network)) {
-    throw new NodeVmmError("--net must be auto, none, or tap");
+  if (!["auto", "none", "tap", "slirp"].includes(network)) {
+    throw new NodeVmmError("--net must be auto, none, tap, or slirp");
   }
   return network as NetworkMode;
 }
 
+function looksLikeNonNegativeInteger(value: string): boolean {
+  return /^(0|[1-9][0-9]*)$/.test(value.trim());
+}
+
+function validateDiskSizeMiB(value: number, flag: string): number {
+  if (value < 1) {
+    throw new NodeVmmError(`${flag} must be at least 1 MiB`);
+  }
+  return value;
+}
+
 function diskSizeOption(parsed: ReturnType<typeof parseCommon>, fallback: number): number {
-  return intOption(parsed, "disk", fallback);
+  if (parsed.values.has("disk-size")) {
+    return validateDiskSizeMiB(intOption(parsed, "disk-size", fallback), "--disk-size");
+  }
+  const disk = stringOption(parsed, "disk");
+  if (disk && looksLikeNonNegativeInteger(disk)) {
+    return validateDiskSizeMiB(Number.parseInt(disk, 10), "--disk");
+  }
+  return fallback;
+}
+
+function runDiskPathOption(parsed: ReturnType<typeof parseCommon>): string | undefined {
+  const diskPath = stringOption(parsed, "disk-path");
+  if (diskPath) {
+    return diskPath;
+  }
+  const disk = stringOption(parsed, "disk");
+  if (!disk || looksLikeNonNegativeInteger(disk)) {
+    return undefined;
+  }
+  return disk;
+}
+
+function prebuiltOption(parsed: ReturnType<typeof parseCommon>) {
+  return parsePrebuiltRootfsMode(stringOption(parsed, "prebuilt") || undefined);
+}
+
+function attachDiskOptions(parsed: ReturnType<typeof parseCommon>) {
+  return [
+    ...stringListOption(parsed, "attach-disk").map((diskPath) => ({ path: diskPath })),
+    ...stringListOption(parsed, "attach-disk-ro").map((diskPath) => ({ path: diskPath, readonly: true })),
+  ];
 }
 
 function portOptions(parsed: ReturnType<typeof parseCommon>): string[] {
@@ -187,7 +247,7 @@ function printRunResult(result: Awaited<ReturnType<typeof runImage>>): void {
   if (result.guestStatus && result.guestStatus !== 0) {
     process.exitCode = result.guestStatus;
   }
-  print(`node-vmm ${result.id} stopped: ${result.exitReason} after ${result.runs} KVM_RUN calls`);
+  print(`node-vmm ${result.id} stopped: ${result.exitReason} after ${result.runs} VM run calls`);
 }
 
 async function commandBuild(args: string[]): Promise<void> {
@@ -205,7 +265,7 @@ async function commandBuild(args: string[]): Promise<void> {
     subdir: stringOption(parsed, "subdir") || undefined,
     contextDir: stringOption(parsed, "context", "."),
     output,
-    diskMiB: diskSizeOption(parsed, 2048),
+    diskSizeMiB: diskSizeOption(parsed, 2048),
     buildArgs: keyValueOption(parsed, "build-arg"),
     env: keyValueOption(parsed, "env"),
     cmd: stringOption(parsed, "cmd") || undefined,
@@ -223,6 +283,11 @@ async function commandBuild(args: string[]): Promise<void> {
 
 async function commandRun(args: string[]): Promise<void> {
   const parsed = parseCommon(args);
+  const diskPath = runDiskPathOption(parsed);
+  const diskSizeMiB = diskSizeOption(parsed, 2048);
+  const attachDisks = attachDiskOptions(parsed);
+  const network = networkOption(parsed);
+  const timeoutMs = timeoutOption(parsed);
   const kernel = await requireKernelPath({ kernel: stringOption(parsed, "kernel") || undefined });
 
   const result = await runImage(
@@ -236,7 +301,12 @@ async function commandRun(args: string[]): Promise<void> {
       subdir: stringOption(parsed, "subdir") || undefined,
       contextDir: stringOption(parsed, "context", "."),
       rootfsPath: stringOption(parsed, "rootfs") || undefined,
-      diskMiB: diskSizeOption(parsed, 2048),
+      diskPath,
+      diskSizeMiB,
+      prebuilt: prebuiltOption(parsed),
+      persist: stringOption(parsed, "persist") || undefined,
+      reset: boolOption(parsed, "reset") || undefined,
+      attachDisks,
       buildArgs: keyValueOption(parsed, "build-arg"),
       env: keyValueOption(parsed, "env"),
       cmd: stringOption(parsed, "cmd") || undefined,
@@ -250,12 +320,12 @@ async function commandRun(args: string[]): Promise<void> {
         : undefined,
       memMiB: intOption(parsed, "mem", 256),
       cpus: intOption(parsed, "cpus", 1),
-      network: networkOption(parsed),
+      network,
       tapName: stringOption(parsed, "tap") || undefined,
       ports: portOptions(parsed),
       cmdline: stringOption(parsed, "cmdline") || undefined,
       bootArgs: stringOption(parsed, "boot-args") || undefined,
-      timeoutMs: timeoutOption(parsed),
+      timeoutMs,
       interactive: boolOption(parsed, "interactive") || undefined,
       sandbox: aliasBoolOption(parsed, "sandbox"),
       restore: aliasBoolOption(parsed, "restore"),
@@ -272,6 +342,11 @@ async function commandRun(args: string[]): Promise<void> {
 
 async function commandCode(args: string[]): Promise<void> {
   const parsed = parseCommon(args);
+  const diskPath = runDiskPathOption(parsed);
+  const diskSizeMiB = diskSizeOption(parsed, 2048);
+  const attachDisks = attachDiskOptions(parsed);
+  const network = networkOption(parsed);
+  const timeoutMs = timeoutOption(parsed);
   const kernel = await requireKernelPath({ kernel: stringOption(parsed, "kernel") || undefined });
   const source = stringOption(parsed, "code") || stringOption(parsed, "js");
   if (!source) {
@@ -292,7 +367,12 @@ async function commandCode(args: string[]): Promise<void> {
       subdir: stringOption(parsed, "subdir") || undefined,
       contextDir: stringOption(parsed, "context", "."),
       rootfsPath: stringOption(parsed, "rootfs") || undefined,
-      diskMiB: diskSizeOption(parsed, 2048),
+      diskPath,
+      diskSizeMiB,
+      prebuilt: prebuiltOption(parsed),
+      persist: stringOption(parsed, "persist") || undefined,
+      reset: boolOption(parsed, "reset") || undefined,
+      attachDisks,
       buildArgs: keyValueOption(parsed, "build-arg"),
       env: keyValueOption(parsed, "env"),
       code: source,
@@ -307,12 +387,12 @@ async function commandCode(args: string[]): Promise<void> {
         : undefined,
       memMiB: intOption(parsed, "mem", 512),
       cpus: intOption(parsed, "cpus", 1),
-      network: networkOption(parsed),
+      network,
       tapName: stringOption(parsed, "tap") || undefined,
       ports: portOptions(parsed),
       cmdline: stringOption(parsed, "cmdline") || undefined,
       bootArgs: stringOption(parsed, "boot-args") || undefined,
-      timeoutMs: timeoutOption(parsed),
+      timeoutMs,
       interactive: false,
       sandbox: aliasBoolOption(parsed, "sandbox"),
       restore: aliasBoolOption(parsed, "restore"),
@@ -328,7 +408,8 @@ async function commandCode(args: string[]): Promise<void> {
 
 async function commandBoot(args: string[]): Promise<void> {
   const parsed = parseCommon(args);
-  const disk = stringOption(parsed, "disk") || stringOption(parsed, "rootfs") || stringOption(parsed, "disk-image");
+  const disk =
+    stringOption(parsed, "disk-path") || stringOption(parsed, "disk") || stringOption(parsed, "rootfs") || stringOption(parsed, "disk-image");
   if (!disk) {
     throw new NodeVmmError("boot requires --disk PATH");
   }
@@ -339,6 +420,7 @@ async function commandBoot(args: string[]): Promise<void> {
       id: stringOption(parsed, "id") || undefined,
       kernelPath: kernel,
       diskPath: disk,
+      attachDisks: attachDiskOptions(parsed),
       memMiB: intOption(parsed, "mem", 256),
       cpus: intOption(parsed, "cpus", 1),
       network: networkOption(parsed),
@@ -368,6 +450,7 @@ async function commandSnapshot(args: string[]): Promise<void> {
     if (!output) {
       throw new NodeVmmError("snapshot create requires --output DIR");
     }
+    const diskSizeMiB = diskSizeOption(parsed, 2048);
     const kernel = await requireKernelPath({ kernel: stringOption(parsed, "kernel") || undefined });
     const result = await createSnapshot(
       {
@@ -381,7 +464,8 @@ async function commandSnapshot(args: string[]): Promise<void> {
         subdir: stringOption(parsed, "subdir") || undefined,
         contextDir: stringOption(parsed, "context", "."),
         rootfsPath: stringOption(parsed, "rootfs") || undefined,
-        diskMiB: diskSizeOption(parsed, 2048),
+        diskSizeMiB,
+        prebuilt: prebuiltOption(parsed),
         buildArgs: keyValueOption(parsed, "build-arg"),
         env: keyValueOption(parsed, "env"),
         cmd: stringOption(parsed, "cmd") || undefined,
@@ -419,6 +503,7 @@ async function commandSnapshot(args: string[]): Promise<void> {
         bootArgs: stringOption(parsed, "boot-args") || undefined,
         timeoutMs: timeoutOption(parsed),
         interactive: boolOption(parsed, "interactive") || undefined,
+        attachDisks: attachDiskOptions(parsed),
         overlayPath: stringOption(parsed, "overlay") || undefined,
         overlayDir: stringOption(parsed, "overlay-dir") || undefined,
         keepOverlay: boolOption(parsed, "keep-overlay"),

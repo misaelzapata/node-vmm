@@ -1,7 +1,7 @@
 import net from "node:net";
 
 import { requireCommands, runCommand } from "./process.js";
-import type { NetworkConfig, PortForward, PortForwardInput } from "./types.js";
+import type { NetworkConfig, PortForward, PortForwardInput, SlirpHostFwd } from "./types.js";
 import { NodeVmmError, compactIdForTap, deterministicMac, requireRoot } from "./utils.js";
 
 export interface SetupNetworkOptions {
@@ -114,6 +114,18 @@ async function closeServer(server: net.Server): Promise<void> {
   });
 }
 
+async function resolveHostPort(host: string, port: number): Promise<number> {
+  if (port !== 0) {
+    return port;
+  }
+  const server = net.createServer();
+  try {
+    return await listen(server, host, 0);
+  } finally {
+    await closeServer(server);
+  }
+}
+
 async function setupPortForwards(
   inputs: PortForwardInput[] | undefined,
   guestIp: string,
@@ -170,9 +182,15 @@ async function setupPortForwards(
 }
 
 export async function setupNetwork(options: SetupNetworkOptions): Promise<NetworkConfig> {
-  const mode = options.mode || (options.tapName ? "tap" : "none");
+  let mode = options.mode || (options.tapName ? "tap" : "none");
+  // On Windows/WHP, "auto" resolves to libslirp user-mode networking. On
+  // Linux/KVM, "auto" stays as the TAP+NAT path further below. Keeping the
+  // CLI symmetric so that `node-vmm run --net auto` works on both backends.
+  if (mode === "auto" && process.platform === "win32") {
+    mode = "slirp";
+  }
   if (mode === "none" && (options.ports?.length ?? 0) > 0) {
-    throw new NodeVmmError("--publish requires --net auto");
+    throw new NodeVmmError("--publish requires --net auto or --net slirp");
   }
   if (mode === "none") {
     return { mode: "none" };
@@ -180,7 +198,7 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
 
   if (mode === "tap") {
     if ((options.ports?.length ?? 0) > 0) {
-      throw new NodeVmmError("--publish requires --net auto");
+      throw new NodeVmmError("--publish requires --net auto or --net slirp");
     }
     if (!options.tapName) {
       throw new NodeVmmError("--net tap requires --tap NAME");
@@ -190,6 +208,44 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
       ifaceId: "eth0",
       tapName: options.tapName,
       guestMac: deterministicMac(options.id),
+    };
+  }
+
+  if (mode === "slirp") {
+    // libslirp uses a fixed 10.0.2.0/24 layout; the guest gets 10.0.2.15,
+    // host is reachable at 10.0.2.2, DNS at 10.0.2.3. Port forwarding goes
+    // through libslirp's hostfwd, so the host-side TCP proxy used for `auto`
+    // mode is not required.
+    const hostFwds: SlirpHostFwd[] = [];
+    for (const p of (options.ports ?? []).map(parsePortForward)) {
+      const hostAddr = p.host || "127.0.0.1";
+      hostFwds.push({
+        udp: false,
+        hostAddr,
+        hostPort: await resolveHostPort(hostAddr, p.hostPort),
+        guestPort: p.guestPort,
+      });
+    }
+    return {
+      mode: "slirp",
+      ifaceId: "eth0",
+      guestMac: deterministicMac(options.id),
+      guestIp: "10.0.2.15",
+      hostIp: "10.0.2.2",
+      dns: "10.0.2.3",
+      cidr: "10.0.2.15/24",
+      // Skip the kernel-side ip= autoconf because it forces the kernel to
+      // wait for the eth0 carrier; the userspace init script in src/rootfs.ts
+      // brings up the interface itself once it sees node_vmm.iface=...
+      kernelNetArgs:
+        "node_vmm.iface=eth0 node_vmm.ip=10.0.2.15/24 node_vmm.gw=10.0.2.2 node_vmm.dns=10.0.2.3",
+      ports: hostFwds.map((h) => ({
+        host: h.hostAddr,
+        hostPort: h.hostPort,
+        guestPort: h.guestPort,
+      })),
+      hostFwds,
+      cleanup: async () => {},
     };
   }
 
