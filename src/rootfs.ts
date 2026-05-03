@@ -1,22 +1,20 @@
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { DockerfileParser, type Instruction } from "dockerfile-ast";
 
 import { extractOciImageToDir, hostArchToOci, pullOciImage } from "./oci.js";
-import { requireCommands, runCommand } from "./process.js";
+import { runCommand } from "./process.js";
+import { buildRootfsDarwin } from "./rootfs-darwin.js";
+import { buildRootfsLinux } from "./rootfs-linux.js";
+import { buildRootfsWin32 } from "./rootfs-win32.js";
 import type { ImageConfig, RootfsBuildOptions, StringMap } from "./types.js";
 import {
   NodeVmmError,
-  commandLineFromImage,
   imageEnvToMap,
-  renderEnvFile,
-  requireRoot,
   shellQuote,
   quoteArgv,
-  workdirFromImage,
 } from "./utils.js";
 
 const EMPTY_IMAGE_CONFIG: ImageConfig = {
@@ -29,122 +27,220 @@ const EMPTY_IMAGE_CONFIG: ImageConfig = {
 };
 const DEFAULT_DOCKERFILE_RUN_TIMEOUT_MS = 300_000;
 
+function renderInteractiveLoginScript(): string {
+  return `  node_vmm_login=/tmp/node-vmm-login
+cat > "$node_vmm_login" <<'NODE_VMM_LOGIN'
+#!/bin/sh
+: > /tmp/node-vmm-login-started 2>/dev/null || true
+if [ -n "$NODE_VMM_TTY_ROWS" ] && [ -n "$NODE_VMM_TTY_COLS" ]; then
+  stty rows "$NODE_VMM_TTY_ROWS" cols "$NODE_VMM_TTY_COLS" 2>/dev/null || true
+  export LINES="$NODE_VMM_TTY_ROWS"
+  export COLUMNS="$NODE_VMM_TTY_COLS"
+fi
+case "$NODE_VMM_COMMAND" in
+  /bin/sh|sh|"")
+    exec /bin/sh -i
+    ;;
+  *)
+    exec /bin/sh -lc "$NODE_VMM_COMMAND"
+    ;;
+esac
+NODE_VMM_LOGIN
+  chmod +x "$node_vmm_login" 2>/dev/null || true
+`;
+}
+
+function renderWindowsConsoleInteractiveBlock(): string {
+  return `  node_vmm_apply_tty_size() {
+    case "$NODE_VMM_TTY_ROWS:$NODE_VMM_TTY_COLS" in
+      *[!0-9:]*|:|*:|:*) return ;;
+    esac
+    stty -F "$1" rows "$NODE_VMM_TTY_ROWS" cols "$NODE_VMM_TTY_COLS" 2>/dev/null || true
+  }
+  if [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && command -v getty >/dev/null 2>&1; then
+    node_vmm_log "[node-vmm] interactive: using getty"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_getty_status=0
+    getty -L -n -l "$node_vmm_login" 115200 ttyS0 xterm-256color || node_vmm_getty_status=$?
+    if [ "$node_vmm_getty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] getty failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_getty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && command -v agetty >/dev/null 2>&1; then
+    node_vmm_log "[node-vmm] interactive: using agetty"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_getty_status=0
+    agetty -L -n -l "$node_vmm_login" ttyS0 115200 xterm-256color || node_vmm_getty_status=$?
+    if [ "$node_vmm_getty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] agetty failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_getty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ "$NODE_VMM_WHP_CONSOLE_ROUTE" != "pty" ] && [ -x /node-vmm/console ] && [ -c /dev/ttyS0 ]; then
+    node_vmm_log "[node-vmm] interactive: using ttyS0"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    # Belt-and-suspenders for the bare-LF rendering bug: 'sane' should
+    # set ONLCR + OPOST but busybox getty/agetty have been observed to
+    # drop them before exec-ing the login shell. Force them on so apk
+    # progress-bar refresh does not leave leading garbage on every line.
+    stty -F /dev/ttyS0 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size /dev/ttyS0
+    node_vmm_tty_status=0
+    /node-vmm/console --tty /dev/ttyS0 "$node_vmm_login" || node_vmm_tty_status=$?
+    if [ "$node_vmm_tty_status" -ne 0 ] && [ ! -e /tmp/node-vmm-login-started ] && [ -x /node-vmm/console ]; then
+      node_vmm_log "[node-vmm] ttyS0 failed before login; using pty helper"
+      /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+    else
+      (exit "$node_vmm_tty_status")
+    fi
+  elif [ "$NODE_VMM_WINDOWS_CONSOLE" = "1" ] && [ -x /node-vmm/console ]; then
+    node_vmm_log "[node-vmm] interactive: using pty helper"
+    /node-vmm/console "$node_vmm_login" 2>/node-vmm/console.err
+`;
+}
+
+function renderLinuxPtyInteractiveBlock(): string {
+  return `  elif [ -x /node-vmm/console ]; then
+    case "$NODE_VMM_COMMAND" in
+      /bin/sh|sh|"")
+        /node-vmm/console /bin/sh -i 2>/node-vmm/console.err
+        node_vmm_log "[node-vmm] shim returned rc=$?"
+        if [ -s /node-vmm/console.err ]; then
+          node_vmm_log "[node-vmm] shim stderr:"
+          node_vmm_cat_console /node-vmm/console.err
+        fi
+        ;;
+      *)
+        /node-vmm/console /bin/sh -lc "$NODE_VMM_COMMAND" 2>/node-vmm/console.err
+        ;;
+    esac
+`;
+}
+
+function renderSerialGettyInteractiveBlock(): string {
+  return `  elif [ "$NODE_VMM_WINDOWS_CONSOLE" != "1" ] && [ -n "$NODE_VMM_CONSOLE" ] && [ -c "$NODE_VMM_CONSOLE" ] && command -v getty >/dev/null 2>&1; then
+    node_vmm_log "[node-vmm] interactive: using serial getty"
+    rm -f /tmp/node-vmm-login-started 2>/dev/null || true
+    node_vmm_tty_name="\${NODE_VMM_CONSOLE#/dev/}"
+    stty -F "$NODE_VMM_CONSOLE" 115200 sane clocal -hupcl onlcr opost 2>/dev/null || true
+    node_vmm_apply_tty_size "$NODE_VMM_CONSOLE"
+    getty -L -n -l "$node_vmm_login" 115200 "$node_vmm_tty_name" xterm-256color
+`;
+}
+
+function renderFallbackInteractiveBlock(): string {
+  return `  else
+    case "$NODE_VMM_COMMAND" in
+      /bin/sh|sh|"")
+        /bin/sh -i
+        ;;
+      *)
+        /bin/sh -lc "$NODE_VMM_COMMAND"
+        ;;
+    esac
+  fi
+`;
+}
+
 export function renderInitScript(options: {
   commandLine: string;
   workdir: string;
   mode?: "batch" | "interactive";
 }): string {
+  // The init script ships both batch and interactive run-blocks; the actual
+  // mode is picked up from NODE_VMM_INTERACTIVE on the kernel cmdline so the
+  // same rootfs can be reused across `--interactive` and `--cmd` invocations.
   const command = shellQuote(options.commandLine);
   const workdir = shellQuote(options.workdir);
-  const interactive = options.mode === "interactive";
-  const runBlock = interactive
-    ? `node_vmm_log "[node-vmm] interactive: $NODE_VMM_COMMAND"
-if [ -x /node-vmm/console ]; then
-  /node-vmm/console /bin/sh -lc "$NODE_VMM_COMMAND" 2>/node-vmm/console.err
+  const runBlock = `if [ "$NODE_VMM_INTERACTIVE" = "1" ]; then
+  node_vmm_log "[node-vmm] interactive: $NODE_VMM_COMMAND"
+  export NODE_VMM_COMMAND
+  # The PTY shim execs argv[1..] verbatim. We MUST exec something that stays
+  # alive on a fresh tty: 'sh -lc cmd' hands its stdin to the wrapper and the
+  # inner shell exits with status 0 (no -i, no input pending). When the user
+  # asked for the default interactive shell, exec '/bin/sh -i' so the shell
+  # blocks on read. Otherwise honour the explicit command (htop, vim, etc).
+${renderInteractiveLoginScript()}${renderWindowsConsoleInteractiveBlock()}${renderLinuxPtyInteractiveBlock()}${renderSerialGettyInteractiveBlock()}${renderFallbackInteractiveBlock()}  # End backend-specific interactive console selection.
+  status=$?
+  printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
+  node_vmm_log "[node-vmm] command exited with status $status"
 else
-  /bin/sh -lc "$NODE_VMM_COMMAND"
-fi
-status=$?
-printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
-node_vmm_log "[node-vmm] command exited with status $status"
-`
-    : `node_vmm_log "[node-vmm] running: $NODE_VMM_COMMAND"
-/bin/sh -lc "$NODE_VMM_COMMAND" >/tmp/node-vmm-command.out 2>&1
-status=$?
-cp /tmp/node-vmm-command.out /node-vmm/command.out 2>/dev/null || true
-printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
-if [ -f /tmp/node-vmm-command.out ]; then
-  node_vmm_cat_console /tmp/node-vmm-command.out
-  if [ -s /tmp/node-vmm-command.out ]; then
-    last_byte="$(tail -c 1 /tmp/node-vmm-command.out 2>/dev/null || true)"
-    if [ -n "$last_byte" ]; then
-      node_vmm_console ""
+  node_vmm_log "[node-vmm] running: $NODE_VMM_COMMAND"
+  /bin/sh -lc "$NODE_VMM_COMMAND" >/tmp/node-vmm-command.out 2>&1
+  status=$?
+  cp /tmp/node-vmm-command.out /node-vmm/command.out 2>/dev/null || true
+  printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
+  if [ -f /tmp/node-vmm-command.out ]; then
+    node_vmm_cat_console /tmp/node-vmm-command.out
+    if [ -s /tmp/node-vmm-command.out ]; then
+      last_byte="$(tail -c 1 /tmp/node-vmm-command.out 2>/dev/null || true)"
+      if [ -n "$last_byte" ]; then
+        node_vmm_console ""
+      fi
     fi
   fi
+  node_vmm_log "[node-vmm] command exited with status $status"
 fi
-node_vmm_log "[node-vmm] command exited with status $status"
 `;
+  void options.mode;
   return `#!/bin/sh
 set +e
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-NODE_VMM_INTERACTIVE=${interactive ? "1" : "0"}
+NODE_VMM_INTERACTIVE=0
 
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-mkdir -p /dev
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || true
-mkdir -p /dev/pts /dev/shm /run /tmp
-if [ -e /dev/console ] && [ ! -c /dev/console ]; then
-  rm -f /dev/console 2>/dev/null || true
-fi
-if [ ! -c /dev/console ]; then
-  mknod /dev/console c 5 1 2>/dev/null || true
-fi
-if [ -e /dev/ttyS0 ] && [ ! -c /dev/ttyS0 ]; then
-  rm -f /dev/ttyS0 2>/dev/null || true
-fi
-if [ ! -c /dev/ttyS0 ]; then
-  mknod /dev/ttyS0 c 4 64 2>/dev/null || true
-fi
-if [ -e /dev/null ] && [ ! -c /dev/null ]; then
-  rm -f /dev/null 2>/dev/null || true
-fi
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# devtmpfs (CONFIG_DEVTMPFS in our kernel) auto-creates /dev/{console,ttyS0,
+# null,zero,random,urandom,port,...}. Only fall back to manual mknod if
+# devtmpfs failed (tmpfs fallback path).
 if [ ! -c /dev/null ]; then
-  mknod /dev/null c 1 3 2>/dev/null || true
+  mount -t tmpfs tmpfs /dev 2>/dev/null
+  for entry in console:5:1 ttyS0:4:64 ttyAMA0:204:64 null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 port:1:4; do
+    name=\${entry%%:*}; rest=\${entry#*:}; major=\${rest%%:*}; minor=\${rest#*:}
+    mknod "/dev/$name" c "$major" "$minor" 2>/dev/null
+  done
 fi
-if [ -e /dev/zero ] && [ ! -c /dev/zero ]; then
-  rm -f /dev/zero 2>/dev/null || true
-fi
-if [ ! -c /dev/zero ]; then
-  mknod /dev/zero c 1 5 2>/dev/null || true
-fi
-if [ -e /dev/full ] && [ ! -c /dev/full ]; then
-  rm -f /dev/full 2>/dev/null || true
-fi
-if [ ! -c /dev/full ]; then
-  mknod /dev/full c 1 7 2>/dev/null || true
-fi
-if [ -e /dev/random ] && [ ! -c /dev/random ]; then
-  rm -f /dev/random 2>/dev/null || true
-fi
-if [ ! -c /dev/random ]; then
-  mknod /dev/random c 1 8 2>/dev/null || true
-fi
-if [ -e /dev/urandom ] && [ ! -c /dev/urandom ]; then
-  rm -f /dev/urandom 2>/dev/null || true
-fi
-if [ ! -c /dev/urandom ]; then
-  mknod /dev/urandom c 1 9 2>/dev/null || true
-fi
-if [ -e /dev/port ] && [ ! -c /dev/port ]; then
-  rm -f /dev/port 2>/dev/null || true
-fi
-if [ ! -c /dev/port ]; then
-  mknod /dev/port c 1 4 2>/dev/null || true
-fi
-chmod 600 /dev/console /dev/ttyS0 2>/dev/null || true
-chmod 666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom 2>/dev/null || true
-mount -t devpts devpts /dev/pts -o ptmxmode=0666,mode=0620 2>/dev/null || mount -t devpts devpts /dev/pts 2>/dev/null || true
-if [ ! -e /dev/ptmx ]; then
-  ln -s pts/ptmx /dev/ptmx 2>/dev/null || mknod /dev/ptmx c 5 2 2>/dev/null || true
-fi
-chmod 666 /dev/ptmx 2>/dev/null || true
-mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
-chmod 1777 /tmp 2>/dev/null || true
+[ -c /dev/ttyS0 ] || mknod /dev/ttyS0 c 4 64 2>/dev/null || true
+[ -c /dev/ttyAMA0 ] || mknod /dev/ttyAMA0 c 204 64 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts -o ptmxmode=0666,mode=0620 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+[ -e /dev/ptmx ] || ln -s pts/ptmx /dev/ptmx 2>/dev/null
+chmod 1777 /tmp 2>/dev/null
 NODE_VMM_CONSOLE=/dev/console
 NODE_VMM_FAST_EXIT=0
+NODE_VMM_RESIZE_ROOTFS=0
+NODE_VMM_WINDOWS_CONSOLE=0
 NODE_VMM_IFACE=
 NODE_VMM_ADDR=
 NODE_VMM_GW=
 NODE_VMM_RUNTIME_DNS=
+NODE_VMM_EPOCH=
+NODE_VMM_UTC=
+NODE_VMM_TTY_COLS=80
+NODE_VMM_TTY_ROWS=24
+NODE_VMM_WHP_CONSOLE_ROUTE=getty
 if [ -c /dev/ttyS0 ]; then
   NODE_VMM_CONSOLE=/dev/ttyS0
-fi
-if [ "$NODE_VMM_INTERACTIVE" != "1" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
-  exec </dev/null >"$NODE_VMM_CONSOLE" 2>&1
-elif [ "$NODE_VMM_INTERACTIVE" != "1" ]; then
-  exec </dev/null
+elif [ -c /dev/ttyAMA0 ]; then
+  NODE_VMM_CONSOLE=/dev/ttyAMA0
 fi
 
 if [ -f /node-vmm/env ]; then
@@ -152,6 +248,9 @@ if [ -f /node-vmm/env ]; then
 fi
 
 NODE_VMM_COMMAND=${command}
+# Parse the kernel cmdline before any stdin/stdout redirect: the interactive
+# branch needs to see node_vmm.interactive=1 to leave fd 0 attached to the
+# serial console for the PTY helper.
 if [ -r /proc/cmdline ]; then
   for node_vmm_arg in $(cat /proc/cmdline); do
     case "$node_vmm_arg" in
@@ -165,6 +264,43 @@ if [ -r /proc/cmdline ]; then
       node_vmm.fast_exit=1)
         NODE_VMM_FAST_EXIT=1
         ;;
+      node_vmm.resize_rootfs=1)
+        NODE_VMM_RESIZE_ROOTFS=1
+        ;;
+      node_vmm.interactive=1)
+        NODE_VMM_INTERACTIVE=1
+        ;;
+      node_vmm.windows_console=1|node_vmm.getty=1)
+        NODE_VMM_WINDOWS_CONSOLE=1
+        ;;
+      node_vmm.console_route=pty)
+        NODE_VMM_WHP_CONSOLE_ROUTE=pty
+        ;;
+      node_vmm.console_route=getty)
+        NODE_VMM_WHP_CONSOLE_ROUTE=getty
+        ;;
+      node_vmm.tty_cols=*)
+        NODE_VMM_TTY_COLS=\${node_vmm_arg#node_vmm.tty_cols=}
+        ;;
+      node_vmm.tty_rows=*)
+        NODE_VMM_TTY_ROWS=\${node_vmm_arg#node_vmm.tty_rows=}
+        ;;
+      node_vmm.term_cols=*)
+        NODE_VMM_TTY_COLS=\${node_vmm_arg#node_vmm.term_cols=}
+        ;;
+      node_vmm.term_rows=*)
+        NODE_VMM_TTY_ROWS=\${node_vmm_arg#node_vmm.term_rows=}
+        ;;
+      console=ttyAMA0*)
+        if [ -c /dev/ttyAMA0 ]; then
+          NODE_VMM_CONSOLE=/dev/ttyAMA0
+        fi
+        ;;
+      console=ttyS0*)
+        if [ -c /dev/ttyS0 ]; then
+          NODE_VMM_CONSOLE=/dev/ttyS0
+        fi
+        ;;
       node_vmm.iface=*)
         NODE_VMM_IFACE=\${node_vmm_arg#node_vmm.iface=}
         ;;
@@ -177,12 +313,33 @@ if [ -r /proc/cmdline ]; then
       node_vmm.dns=*)
         NODE_VMM_RUNTIME_DNS=\${node_vmm_arg#node_vmm.dns=}
         ;;
+      node_vmm.epoch=*)
+        NODE_VMM_EPOCH=\${node_vmm_arg#node_vmm.epoch=}
+        ;;
+      node_vmm.utc=*)
+        NODE_VMM_UTC=\${node_vmm_arg#node_vmm.utc=}
+        ;;
     esac
   done
 fi
 
+export NODE_VMM_TTY_COLS NODE_VMM_TTY_ROWS
+
+if [ -n "$NODE_VMM_UTC" ] && command -v date >/dev/null 2>&1; then
+  node_vmm_utc_text="$(printf '%s' "$NODE_VMM_UTC" | tr '_' ' ')"
+  date -u -s "$node_vmm_utc_text" >/dev/null 2>&1 || true
+elif [ -n "$NODE_VMM_EPOCH" ] && command -v date >/dev/null 2>&1; then
+  date -u -s "@$NODE_VMM_EPOCH" >/dev/null 2>&1 || true
+fi
+
+if [ "$NODE_VMM_INTERACTIVE" != "1" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
+  exec </dev/null >"$NODE_VMM_CONSOLE" 2>&1
+elif [ "$NODE_VMM_INTERACTIVE" != "1" ]; then
+  exec </dev/null
+fi
+
 node_vmm_console() {
-  if [ -c /dev/port ]; then
+  if [ "$NODE_VMM_CONSOLE" = "/dev/ttyS0" ] && [ -c /dev/port ]; then
     node_vmm_port_text "$*" && return
   fi
   if [ -n "$NODE_VMM_CONSOLE" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
@@ -192,7 +349,7 @@ node_vmm_console() {
 }
 
 node_vmm_cat_console() {
-  if [ -c /dev/port ]; then
+  if [ "$NODE_VMM_CONSOLE" = "/dev/ttyS0" ] && [ -c /dev/port ]; then
     node_vmm_port_cat "$1" && return
   fi
   if [ -n "$NODE_VMM_CONSOLE" ] && [ -c "$NODE_VMM_CONSOLE" ]; then
@@ -222,8 +379,11 @@ node_vmm_port_cat() {
 }
 
 node_vmm_exit_now() {
-  if [ -c /dev/port ]; then
-    printf '\\000' | dd of=/dev/port bs=1 seek=1281 count=1 conv=notrunc 2>/dev/null
+  exit_status="$\{1:-0\}"
+  if [ "$NODE_VMM_CONSOLE" = "/dev/ttyS0" ] && [ -c /dev/port ]; then
+    # IO port 0x501 (1281) is the node-vmm paravirt exit port. The status byte
+    # the host reads becomes the run result's "exitStatus".
+    printf "\\\\$(printf '%03o' "$exit_status")" | dd of=/dev/port bs=1 seek=1281 count=1 conv=notrunc 2>/dev/null
   fi
 }
 
@@ -234,6 +394,15 @@ fi
 if [ -n "$NODE_VMM_RUNTIME_DNS" ]; then
   mkdir -p /etc
   printf 'nameserver %s\\n' "$NODE_VMM_RUNTIME_DNS" > /etc/resolv.conf 2>/dev/null || true
+fi
+if [ "$NODE_VMM_RESIZE_ROOTFS" = "1" ] && command -v resize2fs >/dev/null 2>&1; then
+  resize2fs /dev/vda >/dev/null 2>&1 || true
+fi
+if command -v ip >/dev/null 2>&1; then
+  ip link set lo up 2>/dev/null || true
+  ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+else
+  ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null || true
 fi
 if [ -n "$NODE_VMM_IFACE" ] && [ -n "$NODE_VMM_ADDR" ]; then
   if command -v ip >/dev/null 2>&1; then
@@ -252,10 +421,14 @@ if [ -n "$NODE_VMM_IFACE" ] && [ -n "$NODE_VMM_ADDR" ]; then
 fi
 
 cd ${workdir} 2>/dev/null || cd /
-${runBlock}if [ "$NODE_VMM_FAST_EXIT" = "1" ]; then
-  node_vmm_exit_now
+${runBlock}if [ "$NODE_VMM_INTERACTIVE" = "1" ] || [ "$NODE_VMM_FAST_EXIT" = "1" ]; then
+  node_vmm_exit_now "$status"
 fi
 sync
+# Always signal a clean shutdown to the host through the paravirt exit port
+# before falling back to ACPI/reboot, so the runtime returns immediately
+# instead of timing out when the kernel can't actually power down.
+node_vmm_exit_now "$status"
 poweroff -f 2>/dev/null || reboot -f 2>/dev/null || true
 sync
 exit "$status"
@@ -270,29 +443,9 @@ function mergeEnv(imageConfig: ImageConfig, userEnv: StringMap): StringMap {
   };
 }
 
-async function mountRootfs(imagePath: string, mountDir: string, signal?: AbortSignal): Promise<void> {
-  await mkdir(mountDir, { recursive: true });
-  await runCommand("mount", ["-o", "loop", imagePath, mountDir], { signal });
-}
-
-async function unmountRootfs(mountDir: string): Promise<void> {
-  await runCommand("sync", [], { allowFailure: true });
-  const first = await runCommand("umount", [mountDir], { allowFailure: true, capture: true });
-  if (first.code !== 0) {
-    await runCommand("umount", ["-l", mountDir], { capture: true });
-  }
-}
-
-function projectRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-}
-
-async function installConsoleHelper(mountDir: string, tempDir: string): Promise<void> {
-  const helperSource = path.join(projectRoot(), "guest", "node-vmm-console.cc");
-  const helperBin = path.join(tempDir, "node-vmm-console");
-  await runCommand("g++", ["-static", "-Os", "-s", "-o", helperBin, helperSource, "-lutil"]);
-  const target = path.join(mountDir, "node-vmm", "console");
-  await runCommand("install", ["-m", "0755", helperBin, target]);
+async function ensureGuestCaCertificates(_rootfs: string): Promise<void> {
+  // OCI images carry their own trust store; this hook keeps the split
+  // platform builders aligned without changing the guest filesystem.
 }
 
 interface DockerfileStage {
@@ -842,68 +995,29 @@ async function buildDockerfileRootfs(options: RootfsBuildOptions, mountDir: stri
 }
 
 export async function buildRootfs(options: RootfsBuildOptions): Promise<void> {
-  requireRoot("building a rootfs image");
-  const requiredCommands = ["truncate", "mkfs.ext4", "mount", "umount"];
-  if (options.dockerfile) {
-    requiredCommands.push("unshare", "chroot", "cp", "mknod", "chmod", "ln", "rm", "mkdir");
-  }
-  if (options.initMode === "interactive") {
-    requiredCommands.push("g++", "install");
-  }
-  await requireCommands(requiredCommands);
-
-  if (!options.image && !options.dockerfile) {
-    throw new NodeVmmError("build requires --image or --dockerfile");
-  }
-
-  const mountDir = path.join(options.tempDir, "mnt");
-
-  options.signal?.throwIfAborted();
-  await runCommand("truncate", ["-s", `${options.diskMiB}M`, options.output], { signal: options.signal });
-  await runCommand("mkfs.ext4", ["-F", "-L", "rootfs", options.output], { signal: options.signal });
-
-  let mounted = false;
-  try {
-    options.signal?.throwIfAborted();
-    await mountRootfs(options.output, mountDir, options.signal);
-    mounted = true;
-    let imageConfig: ImageConfig;
-    if (options.dockerfile) {
-      imageConfig = await buildDockerfileRootfs(options, mountDir);
-    } else {
-      const pulled = await pullOciImage({
-        image: options.image || "",
-        platformOS: "linux",
-        platformArch: options.platformArch || hostArchToOci(),
-        cacheDir: options.cacheDir,
-        signal: options.signal,
-      });
-      imageConfig = pulled.config || EMPTY_IMAGE_CONFIG;
-      await extractOciImageToDir(pulled, mountDir);
-    }
-
-    const nodeVmmDir = path.join(mountDir, "node-vmm");
-    await mkdir(nodeVmmDir, { recursive: true });
-    const envFile = renderEnvFile(mergeEnv(imageConfig, options.env));
-    await writeFile(path.join(nodeVmmDir, "env"), envFile, { mode: 0o600 });
-    if (options.initMode === "interactive") {
-      await installConsoleHelper(mountDir, options.tempDir);
-    }
-
-    const initScript = renderInitScript({
-      commandLine: commandLineFromImage(imageConfig, {
-        cmd: options.cmd,
-        entrypoint: options.entrypoint,
-      }),
-      workdir: workdirFromImage(imageConfig, options.workdir),
-      mode: options.initMode,
+  if (process.platform === "win32") {
+    await buildRootfsWin32(options, {
+      mergeEnv,
+      renderInitScript,
+      emptyImageConfig: EMPTY_IMAGE_CONFIG,
     });
-    const initPath = path.join(mountDir, "init");
-    await writeFile(initPath, initScript, { mode: 0o755 });
-    await chmod(initPath, 0o755);
-  } finally {
-    if (mounted) {
-      await unmountRootfs(mountDir);
-    }
+    return;
   }
+  if (process.platform === "darwin") {
+    await buildRootfsDarwin(options, {
+      buildDockerfileRootfs,
+      ensureGuestCaCertificates,
+      mergeEnv,
+      renderInitScript,
+      emptyImageConfig: EMPTY_IMAGE_CONFIG,
+    });
+    return;
+  }
+  await buildRootfsLinux(options, {
+    buildDockerfileRootfs,
+    ensureGuestCaCertificates,
+    mergeEnv,
+    renderInitScript,
+    emptyImageConfig: EMPTY_IMAGE_CONFIG,
+  });
 }

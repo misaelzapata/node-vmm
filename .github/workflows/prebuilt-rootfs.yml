@@ -1,0 +1,114 @@
+name: prebuilt-rootfs
+
+# Builds prebuilt ext4 rootfs files for the most common images and
+# attaches them to the matching GitHub Release. Lets Windows users
+# `node-vmm run --image alpine:3.20` boot without a local WSL2 install,
+# and lets anyone download a sandbox-ready rootfs without the OCI fetch
+# overhead.
+#
+# Triggered on tag push (v*) and on workflow_dispatch. The build runs
+# inside ubuntu-latest with sudo because the pipeline uses mkfs.ext4 +
+# mount + chroot.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach prebuilt rootfs files to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.image }} rootfs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: alpine:3.20
+            slug: alpine-3.20
+            disk: 256
+          - image: node:20-alpine
+            slug: node-20-alpine
+            disk: 1024
+          - image: node:22-alpine
+            slug: node-22-alpine
+            disk: 1024
+          - image: oven/bun:1-alpine
+            slug: oven-bun-1-alpine
+            disk: 1024
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libslirp-dev e2fsprogs util-linux
+      - run: npm ci --ignore-scripts
+      - name: Build TS + native (Linux)
+        env:
+          NODE_VMM_FORCE_NATIVE_BUILD: "1"
+        run: npm run build
+      - name: Build prebuilt rootfs
+        run: |
+          mkdir -p dist-rootfs
+          sudo -E node scripts/build-prebuilt-rootfs.mjs \
+            --image "${{ matrix.image }}" \
+            --output "dist-rootfs/${{ matrix.slug }}.ext4" \
+            --disk-mib ${{ matrix.disk }} \
+            --slug "${{ matrix.slug }}"
+      - name: List generated assets
+        run: |
+          cd dist-rootfs
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.slug }}
+          path: |
+            dist-rootfs/${{ matrix.slug }}.ext4.gz
+            dist-rootfs/${{ matrix.slug }}.ext4.manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    name: Attach rootfs prebuilds to release
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/rootfs-*; do
+            cp -v "$dir"/*.ext4.gz release/
+            cp -v "$dir"/*.ext4.manifest.json release/
+          done
+          ls -la release
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.ref }}
+          files: |
+            release/*.ext4.gz
+            release/*.ext4.manifest.json
+          fail_on_unmatched_files: true

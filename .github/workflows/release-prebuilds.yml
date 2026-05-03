@@ -1,0 +1,182 @@
+name: release-prebuilds
+
+# Builds the native addon for Windows, Linux, and Apple Silicon macOS on every
+# tag push, attaches the prebuilds to the matching GitHub Release, then
+# assembles those same prebuilds into the npm package before publishing. The
+# addon uses Node-API, so one binary per OS/arch is enough for supported Node
+# versions.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach prebuilds to (e.g. v0.1.4)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64 prebuild
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      # MSVC is preinstalled on windows-2022 runners. The build script picks
+      # up libslirp via third_party/libslirp (vendored from MSYS2 prebuilts).
+      - name: Vendor libslirp
+        run: node scripts/vendor-libslirp.mjs
+      - run: npm ci --ignore-scripts
+      - name: Build native addon
+        env:
+          NODE_VMM_FORCE_NATIVE_BUILD: "1"
+        run: npm run build:native
+      - name: Stage prebuild
+        run: node scripts/package-prebuild.mjs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-win32-x64
+          path: prebuilds/win32-x64/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build-linux:
+    name: Linux x64 prebuild
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y g++ libslirp-dev libglib2.0-dev
+      - run: npm ci --ignore-scripts
+      - name: Build native addon
+        env:
+          NODE_VMM_FORCE_NATIVE_BUILD: "1"
+        run: npm run build:native
+      - name: Stage prebuild
+        run: node scripts/package-prebuild.mjs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-linux-x64
+          path: prebuilds/linux-x64/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build-macos:
+    name: macOS arm64 prebuild
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+      - run: brew install pkg-config libslirp glib
+      - run: npm ci --ignore-scripts
+      - name: Build native addon
+        env:
+          NODE_VMM_FORCE_NATIVE_BUILD: "1"
+        run: npm run build:native
+      - name: Stage prebuild
+        run: node scripts/package-prebuild.mjs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-darwin-arm64
+          path: prebuilds/darwin-arm64/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    name: Attach prebuilds to release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Bundle prebuilds into tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/prebuild-*; do
+            name=$(basename "$dir")
+            tar -C "$dir" -czf "release/${name}.tar.gz" .
+          done
+          ls -la release
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.ref }}
+          files: release/*.tar.gz
+          fail_on_unmatched_files: true
+
+  publish-npm:
+    name: Publish npm package with all prebuilds
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Restore release prebuilds
+        run: |
+          set -euo pipefail
+          rm -rf prebuilds/linux-x64 prebuilds/win32-x64 prebuilds/darwin-arm64
+          mkdir -p prebuilds/linux-x64 prebuilds/win32-x64 prebuilds/darwin-arm64
+          cp -a artifacts/prebuild-linux-x64/. prebuilds/linux-x64/
+          cp -a artifacts/prebuild-win32-x64/. prebuilds/win32-x64/
+          cp -a artifacts/prebuild-darwin-arm64/. prebuilds/darwin-arm64/
+          find prebuilds -maxdepth 2 -type f -print | sort
+      - run: npm ci --ignore-scripts
+      - run: npm run build:ts
+      - name: Verify npm tarball contents
+        env:
+          NODE_VMM_PACK_REQUIRE_WIN32: "1"
+          NODE_VMM_PACK_REQUIRE_DARWIN: "1"
+        run: node scripts/pack-check.mjs
+      - name: Verify npm auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret is required to publish @misaelzapata/node-vmm"
+            exit 1
+          fi
+      - run: npm publish --dry-run --ignore-scripts --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --ignore-scripts --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

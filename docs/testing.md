@@ -13,6 +13,18 @@ npm run test:real-apps
 npm run bench:node-code
 ```
 
+`npm test` is the local all-in-one smoke: it rebuilds native + TypeScript and
+runs every deterministic test file in `dist/test`. On Windows/WHP this includes
+the native WHP probe, tiny guests, lifecycle, SMP, UART, virtio-blk, prebuilt
+manifest tests, CLI/SDK disk parsing, and docs-backed attach-disk contract
+tests. Environment-gated tests are listed in the output as skipped until their
+kernel/rootfs fixtures are provided.
+
+The 100% badge refers to the strict `c8 --100` TypeScript coverage gate below.
+Native C++ coverage is separate and backend-specific; Linux/KVM uses gcov, while
+Windows/WHP and macOS/HVF currently rely on smoke/e2e gates plus self-hosted or
+local hardware runner matrices.
+
 ## TypeScript
 
 `npm run test:coverage:ts` runs `c8 --100` against deterministic TypeScript
@@ -28,11 +40,15 @@ host/kernel race or e2e-only path it excludes.
 ## Native C++
 
 `npm run test:coverage:cpp` rebuilds the addon with gcov flags, runs native KVM
-smoke tests, and checks `native/kvm_backend.cc` with `scripts/check-gcov.mjs`.
+smoke tests, and checks `native/kvm/backend.cc` with `scripts/check-gcov.mjs`.
 
 Uncovered native lines must be listed in `docs/cpp-coverage-exclusions.json`
 with a reason. This keeps kernel, errno, ioctl, and hardware-only defensive
 branches visible instead of silently ignoring them.
+
+On macOS/HVF, deterministic native coverage is smoke-based: `test/native.test.ts`
+validates `probeHvf()`, FDT generation, PL011 behavior, and the emulated device
+shape. The real guest gate is `npm run test:macos-hvf`.
 
 ## E2E
 
@@ -66,7 +82,9 @@ node dist/src/main.js run \
   --net none
 ```
 
-Rootless runs must avoid rootfs building/mounting and `--net auto`.
+Rootless runs must avoid rootfs building/mounting and `--net auto`. `--net
+slirp` avoids TAP/iptables setup when the Linux native addon was built with
+libslirp.
 
 ## Port Publishing Smoke
 
@@ -83,6 +101,19 @@ sudo -n node dist/src/main.js run \
   --timeout-ms 30000
 
 curl http://127.0.0.1:18080
+```
+
+Linux/KVM also supports explicit libslirp user-mode networking:
+
+```bash
+sudo -n node dist/src/main.js run \
+  --image node:22-alpine \
+  --cmd "node -e \"require('node:http').createServer((_, r) => r.end('ok\\n')).listen(3000, '0.0.0.0')\"" \
+  --net slirp \
+  -p 18081:3000 \
+  --timeout-ms 30000
+
+curl http://127.0.0.1:18081
 ```
 
 `-p 3000`, `-p 18080:3000`, and
@@ -166,6 +197,120 @@ The script uses only temporary npm and OCI caches under
 `/tmp/node-vmm-real-apps-*`; it does not use the user's global npm cache. It
 removes generated apps, rootfs disks, caches, and overlays in `finally`, with a
 `sudo -n rm -rf` fallback for root-owned build artifacts.
+
+## Windows WHP Framework App Smoke
+
+`npm run test:whp-apps` is the Windows/WHP runtime counterpart to the Linux
+real-app gate. It uses `node:22-alpine`, creates the same framework apps inside
+the guest, publishes guest port `3000` through WHP/libslirp, waits for HTTP,
+pauses the VM, verifies HTTP blocks while paused, resumes the VM, verifies HTTP
+again, and stops the VM.
+
+```powershell
+npm run test:whp-apps
+```
+
+It covers:
+
+- plain Node HTTP
+- Express
+- Fastify
+- official Next.js hello-world via `create-next-app@16.2.4`
+- Vite React via `create-vite@9.0.6 --template react`
+- Vite Vue via `create-vite@9.0.6 --template vue`
+
+Use `NODE_VMM_WHP_APP_CASES=express,fastify` to run a subset while debugging.
+This smoke proves the WHP VM runtime, port publishing, guest networking, and
+pause/resume behavior for the same app families as Linux. It does not replace
+the Linux Dockerfile builder gate; custom Dockerfile and repo rootfs builds on
+Windows intentionally continue to use the Linux/WSL2 builder path.
+
+## macOS HVF E2E
+
+`npm run test:macos-hvf` is the Apple Silicon runtime gate. It runs only on
+macOS arm64, signs a private Node copy with the
+`com.apple.security.hypervisor` entitlement when needed, and re-execs through
+that signed binary.
+
+```bash
+brew install e2fsprogs pkg-config libslirp glib
+npm run test:macos-hvf
+```
+
+Set `NODE_VMM_KERNEL=/path/to/arm64/Image` to use a local guest kernel instead
+of the fetched default ARM64 kernel.
+
+It covers:
+
+- `features()`, `doctor()`, and `probeHvf()` on a real HVF host.
+- ARM64 kernel resolution.
+- ARM64 Alpine rootfs creation from OCI layers without sudo.
+- batch command output through PL011 `/dev/ttyAMA0`.
+- interactive PTY shell input, host TTY sizing, and guest `Ctrl-C` delivery.
+- QEMU `virt` device-tree nodes used by the HVF subset.
+- two-vCPU boot through PSCI.
+- Slirp IP/DNS/outbound networking.
+- `apk update`, `apk add --no-cache htop nodejs npm`, and Node execution.
+- `node:22-alpine` `runCode()` on ARM64.
+- Slirp TCP port forwarding with `startVm()`, pause, resume, and stop.
+
+Optional vmnet coverage is gated because it depends on host networking policy:
+
+```bash
+NODE_VMM_HVF_TEST_VMNET=1 npm run test:macos-hvf
+```
+
+For manual package-install timing on this host, the current Alpine ARM64 path
+with `--disk 312` completed `apk update` in about 8 seconds and
+`apk add --no-cache nodejs npm` in about 12 seconds. Use `--disk 512` as the
+normal development default so package caches and larger experiments have room.
+
+## macOS Coverage Matrix
+
+| Surface | Command or test | What it proves |
+| --- | --- | --- |
+| HVF probe and host capability | `npm run test:macos-hvf` | `features()`, `doctor()`, and `probeHvf()` report an available arm64 HVF backend. |
+| Native device shape | `node --test dist/test/native.test.js` | `hvfFdtSmoke()`, `hvfPl011Smoke()`, and `hvfDeviceSmoke()` validate FDT, UART, and device construction. |
+| Real Alpine HVF e2e | `npm run test:macos-hvf` | ARM64 rootfs build, boot, console, SMP, Slirp, `apk`, Node install, and lifecycle. |
+| Slirp port forwarding | `npm run test:macos-hvf` | Guest HTTP published through libslirp remains correct across pause/resume. |
+| Optional vmnet path | `NODE_VMM_HVF_TEST_VMNET=1 npm run test:macos-hvf` | Exercises the privileged vmnet/socket_vmnet alternative when the host is configured for it. |
+| Darwin package shape | `npm run pack:check` | Validates Darwin dylib bundling when `prebuilds/darwin-arm64` is present. |
+
+## Windows Coverage Matrix
+
+| Surface | Command or test | What it proves |
+| --- | --- | --- |
+| Hosted Windows package shape | `NODE_VMM_SKIP_NATIVE=1 npm ci --ignore-scripts`, `npm run build:ts`, `npm pack --dry-run --ignore-scripts` | Windows can install/import/pack the JS package without native WHP execution. |
+| WHP probe and dirty tracking | `node --test .\dist\test\native.test.js` | `probeWhp()` and `whpSmokeHlt()` can create a partition, run a tiny guest, and query dirty pages. |
+| WHP lifecycle and SMP smoke | `node --test .\dist\test\native.test.js` | Generated ELF guests cover run, pause/resume/stop, and multi-vCPU control. |
+| Real Alpine WHP e2e | `$env:NODE_VMM_WHP_FULL_E2E = "1"; node --test .\dist\test\native.test.js` | Alpine rootfs boot, virtio block overlay, Slirp DNS/networking, TCP-ready runtime pieces, RNG, clock, `apk`, console idle CPU, and guest Ctrl-C. |
+| Framework runtime smoke | `npm run test:whp-apps` | Plain Node, Express, Fastify, Next.js, Vite React, and Vite Vue run inside WHP through `node:22-alpine` with HTTP plus pause/resume checks. |
+| Prebuilt rootfs slug parity | `prebuiltSlugForImage maps the published images and rejects others` in `test/unit.test.ts` | Supported image refs stay aligned with release asset names. |
+| Prebuilt fallback | `tryFetchPrebuiltRootfs returns fetched:false on missing release` in `test/unit.test.ts` | Missing release assets do not throw or leave partial disks; callers can fall back to WSL2. |
+| No-WSL cache hit | `buildOrReuseRootfs cache hit returns the cached path without rebuilding (no WSL2 spawn)` in `test/unit.test.ts` | Prepared rootfs cache hits return before any builder path. |
+| No-WSL explicit rootfs | `runImage with --rootfs never enters the build pipeline` in `test/unit.test.ts` | `rootfsPath`/`--rootfs` never invokes WSL2 or rootfs creation. |
+| Prebuilt release asset production | `.github/workflows/prebuilt-rootfs.yml` | Builds `alpine:3.20`, `node:20-alpine`, `node:22-alpine`, and `oven/bun:1-alpine` ext4 assets and uploads `.ext4.gz` plus `.ext4.manifest.json`. |
+| Attach/secondary disks | `NODE_VMM_WHP_ATTACH_DISKS_E2E=1 node --test .\dist\test\native.test.js` plus unit validation | WHP e2e maps a data disk after `/dev/vda` and verifies raw guest writes persist to the host file. |
+
+Recommended local Windows verification after touching WHP/disk code:
+
+```powershell
+npm test
+npm run test:coverage:ts
+node --check .\scripts\build-prebuilt-rootfs.mjs
+node --check .\scripts\package-prebuild.mjs
+git diff --check
+```
+
+Run the fixture-gated WHP rootfs checks when you have a kernel and ext4 rootfs:
+
+```powershell
+$env:NODE_VMM_WHP_E2E_KERNEL = "C:\path\to\vmlinux"
+$env:NODE_VMM_WHP_E2E_ROOTFS = "C:\path\to\alpine.ext4"
+$env:NODE_VMM_WHP_FULL_E2E = "1"
+$env:NODE_VMM_WHP_ATTACH_DISKS_E2E = "1"
+node --test .\dist\test\native.test.js
+```
 
 ## Node Code Benchmark
 

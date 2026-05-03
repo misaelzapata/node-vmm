@@ -8,23 +8,33 @@ import { gunzipSync } from "node:zlib";
 
 import { NodeVmmError } from "./utils.js";
 
-export const DEFAULT_GOCRACKER_KERNEL = "gocracker-guest-standard-vmlinux";
-export const GOCRACKER_KERNEL_BASE_URL =
+export const DEFAULT_NODE_VMM_KERNEL = "gocracker-guest-standard-vmlinux";
+export const DEFAULT_NODE_VMM_ARM64_KERNEL = "gocracker-guest-standard-arm64-Image";
+export const LEGACY_NODE_VMM_ARM64_KERNEL = "gocracker-guest-minimal-arm64-Image";
+export const NODE_VMM_KERNEL_BASE_URL =
   "https://raw.githubusercontent.com/misaelzapata/gocracker/main/artifacts/kernels";
 export const NODE_VMM_KERNEL_ENV = "NODE_VMM_KERNEL";
 export const NODE_VMM_KERNEL_CACHE_DIR_ENV = "NODE_VMM_KERNEL_CACHE_DIR";
 export const NODE_VMM_KERNEL_REPO_ENV = "NODE_VMM_KERNEL_REPO";
-export const NODE_VMM_GOCRACKER_REPO_DIR_ENV = "NODE_VMM_GOCRACKER_REPO_DIR";
+export const NODE_VMM_KERNEL_REPO_DIR_ENV = "NODE_VMM_KERNEL_REPO_DIR";
 export const NODE_VMM_KERNEL_SHA256_ENV = "NODE_VMM_KERNEL_SHA256";
 export const NODE_VMM_KERNEL_MAX_GZIP_BYTES_ENV = "NODE_VMM_KERNEL_MAX_GZIP_BYTES";
 export const NODE_VMM_KERNEL_MAX_BYTES_ENV = "NODE_VMM_KERNEL_MAX_BYTES";
+
+export const DEFAULT_GOCRACKER_KERNEL = DEFAULT_NODE_VMM_KERNEL;
+export const DEFAULT_GOCRACKER_ARM64_KERNEL = DEFAULT_NODE_VMM_ARM64_KERNEL;
+export const LEGACY_GOCRACKER_ARM64_KERNEL = LEGACY_NODE_VMM_ARM64_KERNEL;
+export const GOCRACKER_KERNEL_BASE_URL = NODE_VMM_KERNEL_BASE_URL;
+export const NODE_VMM_GOCRACKER_REPO_DIR_ENV = "NODE_VMM_GOCRACKER_REPO_DIR";
 
 const DEFAULT_KERNEL_MAX_GZIP_BYTES = 256 * 1024 * 1024;
 const DEFAULT_KERNEL_MAX_BYTES = 1024 * 1024 * 1024;
 const MAX_KERNEL_SHA256_SIDECAR_BYTES = 64 * 1024;
 
 const DEFAULT_KERNEL_SHA256: Record<string, string> = {
-  [DEFAULT_GOCRACKER_KERNEL]: "d211c41e571a2f262796cd1631e1c69e6e5ca6345248a6c628a9868f05371ff3",
+  [DEFAULT_NODE_VMM_KERNEL]: "d211c41e571a2f262796cd1631e1c69e6e5ca6345248a6c628a9868f05371ff3",
+  [DEFAULT_NODE_VMM_ARM64_KERNEL]: "88fd13179b8d86afb817cfc41a305ad6d42642a2e27bb461da3a81024aaf715b",
+  [LEGACY_NODE_VMM_ARM64_KERNEL]: "9bdcf296dcaf7742e3cfdc44e9e7dd52b4af4ebd920be5bf49074772e00537f0",
 };
 
 interface FetchResponseLike {
@@ -89,25 +99,47 @@ export function defaultKernelCacheDir(env: NodeJS.ProcessEnv = process.env): str
   return env[NODE_VMM_KERNEL_CACHE_DIR_ENV] || path.join(os.homedir(), ".cache", "node-vmm", "kernels");
 }
 
-export function gocrackerKernelUrl(
-  name = DEFAULT_GOCRACKER_KERNEL,
+export function nodeVmmKernelUrl(
+  name = DEFAULT_NODE_VMM_KERNEL,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const baseUrl = env[NODE_VMM_KERNEL_REPO_ENV] || GOCRACKER_KERNEL_BASE_URL;
+  const baseUrl = env[NODE_VMM_KERNEL_REPO_ENV] || NODE_VMM_KERNEL_BASE_URL;
   return `${baseUrl.replace(/\/+$/, "")}/${name}.gz`;
+}
+
+export const gocrackerKernelUrl = nodeVmmKernelUrl;
+
+export function defaultArm64KernelName(): string {
+  return DEFAULT_NODE_VMM_ARM64_KERNEL;
+}
+
+export function defaultKernelNameForPlatform(platform: NodeJS.Platform = process.platform): string {
+  return platform === "darwin" ? DEFAULT_NODE_VMM_ARM64_KERNEL : DEFAULT_NODE_VMM_KERNEL;
+}
+
+export function defaultKernelNamesForPlatform(platform: NodeJS.Platform = process.platform): string[] {
+  return platform === "darwin"
+    ? [DEFAULT_NODE_VMM_ARM64_KERNEL, LEGACY_NODE_VMM_ARM64_KERNEL]
+    : [DEFAULT_NODE_VMM_KERNEL];
 }
 
 export function defaultKernelCandidates(options: KernelLookupOptions = {}): string[] {
   const cwd = options.cwd || process.cwd();
   const env = options.env || process.env;
-  const name = options.name || DEFAULT_GOCRACKER_KERNEL;
-  const repoDir = env[NODE_VMM_GOCRACKER_REPO_DIR_ENV] || path.resolve(cwd, "../gocracker");
-  return unique([
-    path.join(defaultKernelCacheDir(env), name),
-    path.resolve(cwd, ".node-vmm", "kernels", name),
-    path.resolve(cwd, "artifacts", "kernels", name),
-    path.join(resolvePath(cwd, repoDir), "artifacts", "kernels", name),
-  ]);
+  const names = options.name ? [options.name] : defaultKernelNamesForPlatform();
+  const repoDirs = unique([
+    env[NODE_VMM_KERNEL_REPO_DIR_ENV],
+    env[NODE_VMM_GOCRACKER_REPO_DIR_ENV],
+    path.resolve(cwd, "../node-vmm-kernel"),
+    path.resolve(cwd, "../gocracker"),
+  ].filter((item): item is string => Boolean(item)));
+  const locations = [
+    (name: string) => path.join(defaultKernelCacheDir(env), name),
+    (name: string) => path.resolve(cwd, ".node-vmm", "kernels", name),
+    (name: string) => path.resolve(cwd, "artifacts", "kernels", name),
+    ...repoDirs.map((repoDir) => (name: string) => path.join(resolvePath(cwd, repoDir), "artifacts", "kernels", name)),
+  ];
+  return unique(names.flatMap((name) => locations.map((location) => location(name))));
 }
 
 export async function findDefaultKernel(options: KernelLookupOptions = {}): Promise<string | undefined> {
@@ -240,14 +272,14 @@ async function expectedKernelSha256(options: KernelFetchOptions, name: string, u
   );
 }
 
-export async function fetchGocrackerKernel(options: KernelFetchOptions = {}): Promise<KernelFetchResult> {
+export async function fetchNodeVmmKernel(options: KernelFetchOptions = {}): Promise<KernelFetchResult> {
   options.signal?.throwIfAborted();
   const cwd = options.cwd || process.cwd();
   const env = options.env || process.env;
-  const name = options.name || DEFAULT_GOCRACKER_KERNEL;
+  const name = options.name || defaultKernelNameForPlatform();
   const outputDir = resolvePath(cwd, options.outputDir || defaultKernelCacheDir(env));
   const outputPath = path.join(outputDir, name);
-  const url = gocrackerKernelUrl(name, env);
+  const url = nodeVmmKernelUrl(name, env);
   validateKernelDownloadUrl(url);
   if (!options.force && (await exists(outputPath))) {
     return { path: outputPath, url, downloaded: false, bytes: 0, sha256: "" };
@@ -283,3 +315,5 @@ export async function fetchGocrackerKernel(options: KernelFetchOptions = {}): Pr
   /* c8 ignore stop */
   return { path: outputPath, url, downloaded: true, bytes: kernel.byteLength, sha256: actual };
 }
+
+export const fetchGocrackerKernel = fetchNodeVmmKernel;
