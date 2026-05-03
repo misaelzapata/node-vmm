@@ -58,6 +58,7 @@ import { boolOption, intOption, keyValueOption, stringListOption, stringOption }
 import {
   defaultKernelCmdline,
   hvfDefaultKernelCmdline,
+  probeHvf,
   runHvfVm,
   runHvfVmAsync,
   runHvfVmControlled,
@@ -329,6 +330,7 @@ test("kernel helpers resolve node-vmm env, cache, gocracker URLs, and downloads"
   assert.equal(gocrackerKernelUrl(DEFAULT_GOCRACKER_KERNEL, env), "https://example.test/kernels/gocracker-guest-standard-vmlinux.gz");
   assert.match(gocrackerKernelUrl("custom", {} as NodeJS.ProcessEnv), /gocracker\/main\/artifacts\/kernels\/custom\.gz$/);
   assert.ok(defaultKernelCandidates({ cwd: dir, env }).includes(cachedKernel));
+  assert.ok(defaultKernelCandidates({ cwd: dir, env, name: "custom-kernel" }).some((candidate) => candidate.endsWith("custom-kernel")));
   assert.ok(defaultKernelCandidates({ env }).some((candidate) => candidate.endsWith(platformKernel)));
   assert.equal(await requireKernelPath({ cwd: dir, env }), cachedKernel);
   assert.equal(await findDefaultKernel({ cwd: dir, env: { NODE_VMM_KERNEL: "rel/vmlinux" } as NodeJS.ProcessEnv }), path.join(dir, "rel/vmlinux"));
@@ -734,8 +736,10 @@ test("host capabilities model backend defaults and WHP runtime limits", () => {
   assert.equal(kvm.archLine, "linux/x86_64");
   assert.equal(defaultNetworkForCapabilities(kvm, undefined), "auto");
   assert.equal(defaultNetworkForCapabilities(kvm, undefined, "tap-test"), "tap");
+  assert.deepEqual(kvm.networkModes, ["auto", "none", "tap", "slirp"]);
   assert.equal(kvm.rootfsMaxCpus, 64);
   assert.doesNotThrow(() => validateVmOptionsForCapabilities({ cpus: 64, network: "auto", ports: ["3000"] }, kvm));
+  assert.doesNotThrow(() => validateVmOptionsForCapabilities({ cpus: 64, network: "slirp", ports: ["3000"] }, kvm));
   assert.doesNotThrow(() => validateRootfsRuntimeForCapabilities("run", { cpus: 64 }, kvm));
   assert.doesNotThrow(() => assertRootfsBuildSupportedForCapabilities("run", { image: "alpine:3.20" }, kvm));
 
@@ -1057,6 +1061,9 @@ test("runKvmVmControlled exposes lifecycle helpers and forwards native validatio
 });
 
 test("HVF run wrappers forward native validation errors", async () => {
+  if (process.platform !== "darwin" || process.arch !== "arm64") {
+    assert.throws(() => probeHvf(), /probeHvf|native backend/);
+  }
   assert.match(hvfDefaultKernelCmdline(), /console=ttyAMA0/);
   const config = { kernelPath: "", rootfsPath: "", cmdline: "", memMiB: 1, cpus: 2 };
   assert.throws(() => runHvfVm(config), /kernelPath is required/);

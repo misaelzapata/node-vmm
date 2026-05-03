@@ -5,9 +5,10 @@ uses safe defaults and cleans temporary rootfs/cache artifacts it owns.
 
 Linux/KVM and Windows/WHP are the supported x64 host backends. VM execution
 expects a Linux guest kernel. Linux/KVM uses `/dev/kvm` and needs root
-privileges for rootfs mounting and automatic TAP/NAT setup; Windows/WHP runs the
-VM as the current Windows user and only uses WSL2 when it must build a fresh
-rootfs locally from OCI layers.
+privileges for rootfs mounting and automatic TAP/NAT setup. Explicit
+`net: "slirp"` uses user-mode networking when the Linux native addon was built
+with libslirp. Windows/WHP runs the VM as the current Windows user and only uses
+WSL2 when it must build a fresh rootfs locally from OCI layers.
 
 ## Running Without Sudo
 
@@ -38,7 +39,8 @@ console.log(result.guestOutput);
 ```
 
 Root is still required on Linux when the SDK builds/mounts rootfs images or
-creates automatic TAP/NAT networking. Windows/WHP does not use Linux `sudo`.
+creates automatic TAP/NAT networking. Use `net: "slirp"` with a prepared rootfs
+to avoid TAP/iptables setup. Windows/WHP does not use Linux `sudo`.
 
 ## Simple API
 

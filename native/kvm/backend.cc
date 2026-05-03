@@ -3,9 +3,11 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <linux/if_tun.h>
 #include <linux/kvm.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -34,6 +36,16 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+extern "C" {
+#if __has_include(<libslirp.h>)
+#include <libslirp.h>
+#else
+#include <slirp/libslirp.h>
+#endif
+}
+#endif
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -1576,12 +1588,6 @@ class Uart {
   }
 
 	  void handle_tx_byte(uint8_t value) {
-    if (echo_stdout_) {
-      char byte = static_cast<char>(value);
-      std::lock_guard<std::mutex> lock(mu_);
-      emit_tx_locked(std::string(&byte, 1));
-      return;
-    }
     static const std::string query = "\x1b[6n";
     std::lock_guard<std::mutex> lock(mu_);
     if (!terminal_query_.empty() || value == 0x1B) {
@@ -2084,6 +2090,13 @@ Fd OpenTap(const std::string& tap_name) {
   return fd;
 }
 
+struct SlirpHostFwdConfig {
+  bool udp{false};
+  uint32_t host_ip{0};
+  uint16_t host_port{0};
+  uint16_t guest_port{0};
+};
+
 class VirtioNet {
  public:
   VirtioNet(
@@ -2092,11 +2105,27 @@ class VirtioNet {
       uint64_t mmio_base,
       uint32_t irq,
       const std::string& tap_name,
-      const std::string& mac)
-      : sys_(sys), mem_(mem), mmio_base_(mmio_base), irq_(irq), tap_(OpenTap(tap_name)), mac_(ParseMac(mac)) {
+      const std::string& mac,
+      bool slirp_enabled,
+      const std::string& slirp_host_ip,
+      const std::string& slirp_guest_ip,
+      const std::string& slirp_netmask,
+      const std::string& slirp_dns,
+      const std::vector<SlirpHostFwdConfig>& slirp_host_fwds)
+      : sys_(sys),
+        mem_(mem),
+        mmio_base_(mmio_base),
+        irq_(irq),
+        tap_(slirp_enabled ? Fd{} : OpenTap(tap_name)),
+        mac_(ParseMac(mac)) {
     queues_[0].size = kMaxQueueSize;
     queues_[1].size = kMaxQueueSize;
+    if (slirp_enabled) {
+      start_slirp(slirp_host_ip, slirp_guest_ip, slirp_netmask, slirp_dns, slirp_host_fwds);
+    }
   }
+
+  ~VirtioNet() { stop_slirp(); }
 
   uint64_t mmio_base() const { return mmio_base_; }
 
@@ -2130,6 +2159,11 @@ class VirtioNet {
   }
 
   void poll_rx() {
+    if (slirp_enabled()) {
+      poll_slirp();
+      flush_slirp_rx();
+      return;
+    }
     if (!queues_[0].ready) {
       drain_tap(false);
       return;
@@ -2152,13 +2186,16 @@ class VirtioNet {
       if (n == 0) {
         break;
       }
-      inject_rx_frame(frame, static_cast<size_t>(n));
+      (void)inject_rx_frame(frame, static_cast<size_t>(n));
     }
   }
 
-	  bool enabled() const { return tap_.get() >= 0; }
+	  bool enabled() const { return tap_.get() >= 0 || slirp_enabled(); }
 
 	  bool tap_readable() const {
+    if (slirp_enabled()) {
+      return true;
+    }
 	    struct pollfd pfd {};
 	    pfd.fd = tap_.get();
 	    pfd.events = POLLIN;
@@ -2333,8 +2370,11 @@ class VirtioNet {
     return q.ready && q.last_avail != ReadU16(mem_.ptr(q.driver_addr + 2, 2));
   }
 
-  void inject_rx_frame(const uint8_t* frame, size_t len) {
+  bool inject_rx_frame(const uint8_t* frame, size_t len) {
     Queue& q = queues_[0];
+    if (!has_rx_buffer(q)) {
+      return false;
+    }
     uint16_t head = ReadU16(mem_.ptr(q.driver_addr + 4 + uint64_t(q.last_avail % q.size) * 2, 2));
     q.last_avail++;
 	    DescChain chain = walk_chain(q, head);
@@ -2363,10 +2403,11 @@ class VirtioNet {
       }
     }
     if (offset < needed) {
-      return;
+      return false;
     }
     push_used(q, head, static_cast<uint32_t>(needed));
     signal_queue();
+    return true;
   }
 
   void handle_tx_queue() {
@@ -2385,6 +2426,7 @@ class VirtioNet {
 	    DescChain chain = walk_chain(q, head);
 	    std::array<struct iovec, kMaxQueueSize> iov {};
 	    int iov_len = 0;
+    std::vector<uint8_t> packet;
 	    size_t skip = 12;
 	    for (size_t i = 0; i < chain.size; i++) {
 	      const Desc& d = chain[i];
@@ -2397,12 +2439,21 @@ class VirtioNet {
 	      pos = skip;
 	      skip = 0;
 	      if (d.len > pos && iov_len < static_cast<int>(iov.size())) {
-	        iov[iov_len].iov_base = mem_.ptr(d.addr + pos, d.len - pos);
+        uint8_t* data = mem_.ptr(d.addr + pos, d.len - pos);
+        if (slirp_enabled()) {
+          packet.insert(packet.end(), data, data + d.len - pos);
+        } else {
+	        iov[iov_len].iov_base = data;
 	        iov[iov_len].iov_len = d.len - pos;
 	        iov_len++;
+        }
 	      }
 	    }
-	    if (iov_len > 0) {
+    if (slirp_enabled()) {
+      input_slirp_packet(packet.data(), packet.size());
+      poll_slirp();
+      flush_slirp_rx();
+    } else if (iov_len > 0) {
 	      ssize_t n = writev(tap_.get(), iov.data(), iov_len);
 	      if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
 	        throw std::runtime_error(ErrnoMessage("write tap"));
@@ -2413,6 +2464,9 @@ class VirtioNet {
   }
 
   void drain_tap(bool throw_errors) {
+    if (tap_.get() < 0) {
+      return;
+    }
     uint8_t buf[2048];
     for (;;) {
       ssize_t n = read(tap_.get(), buf, sizeof(buf));
@@ -2429,6 +2483,215 @@ class VirtioNet {
     }
   }
 
+  bool slirp_enabled() const {
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+    return slirp_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  void start_slirp(
+      const std::string& host_ip,
+      const std::string& guest_ip,
+      const std::string& netmask,
+      const std::string& dns,
+      const std::vector<SlirpHostFwdConfig>& host_fwds) {
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+    in_addr host_addr{};
+    in_addr guest_addr{};
+    in_addr mask_addr{};
+    in_addr dns_addr{};
+    const std::string effective_host = host_ip.empty() ? "10.0.2.2" : host_ip;
+    const std::string effective_guest = guest_ip.empty() ? "10.0.2.15" : guest_ip;
+    const std::string effective_mask = netmask.empty() ? "255.255.255.0" : netmask;
+    const std::string effective_dns = dns.empty() ? "10.0.2.3" : dns;
+    Check(inet_pton(AF_INET, effective_host.c_str(), &host_addr) == 1, "invalid slirp host IP: " + effective_host);
+    Check(inet_pton(AF_INET, effective_guest.c_str(), &guest_addr) == 1, "invalid slirp guest IP: " + effective_guest);
+    Check(inet_pton(AF_INET, effective_mask.c_str(), &mask_addr) == 1, "invalid slirp netmask: " + effective_mask);
+    Check(inet_pton(AF_INET, effective_dns.c_str(), &dns_addr) == 1, "invalid slirp DNS IP: " + effective_dns);
+
+    in_addr network_addr{};
+    network_addr.s_addr = htonl(ntohl(host_addr.s_addr) & ntohl(mask_addr.s_addr));
+
+    SlirpConfig cfg{};
+    cfg.version = SLIRP_CONFIG_VERSION_MAX;
+    cfg.in_enabled = true;
+    cfg.vnetwork = network_addr;
+    cfg.vnetmask = mask_addr;
+    cfg.vhost = host_addr;
+    cfg.vdhcp_start = guest_addr;
+    cfg.vnameserver = dns_addr;
+    cfg.if_mtu = 1500;
+    cfg.if_mru = 1500;
+
+    memset(&slirp_cb_, 0, sizeof(slirp_cb_));
+    slirp_cb_.send_packet = &VirtioNet::slirp_send_packet_cb;
+    slirp_cb_.guest_error = &VirtioNet::slirp_guest_error_cb;
+    slirp_cb_.clock_get_ns = &VirtioNet::slirp_clock_get_ns_cb;
+    slirp_cb_.notify = &VirtioNet::slirp_notify_cb;
+    slirp_cb_.register_poll_fd = &VirtioNet::slirp_register_poll_fd_cb;
+    slirp_cb_.unregister_poll_fd = &VirtioNet::slirp_unregister_poll_fd_cb;
+
+    slirp_ = slirp_new(&cfg, &slirp_cb_, this);
+    Check(slirp_ != nullptr, "slirp_new failed");
+
+    for (const SlirpHostFwdConfig& fwd : host_fwds) {
+      in_addr host_bind{};
+      in_addr guest_bind = guest_addr;
+      host_bind.s_addr = htonl(fwd.host_ip);
+      int rc = slirp_add_hostfwd(slirp_, fwd.udp ? 1 : 0, host_bind, fwd.host_port, guest_bind, fwd.guest_port);
+      Check(rc == 0, "slirp host forward failed: " + std::to_string(fwd.host_port) + " -> " +
+                     effective_guest + ":" + std::to_string(fwd.guest_port));
+    }
+#else
+    (void)host_ip;
+    (void)guest_ip;
+    (void)netmask;
+    (void)dns;
+    (void)host_fwds;
+    throw std::runtime_error("Linux/KVM slirp networking is not available in this build; install libslirp-dev and rebuild");
+#endif
+  }
+
+  void stop_slirp() {
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+    if (slirp_ != nullptr) {
+      slirp_cleanup(slirp_);
+      slirp_ = nullptr;
+    }
+#endif
+  }
+
+  void input_slirp_packet(const uint8_t* data, size_t len) {
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+    if (slirp_ != nullptr && data != nullptr && len > 0) {
+      slirp_input(slirp_, data, static_cast<int>(len));
+    }
+#else
+    (void)data;
+    (void)len;
+#endif
+  }
+
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+  struct SlirpPollSet {
+    std::vector<pollfd> fds;
+  };
+#endif
+
+  void poll_slirp() {
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+    if (slirp_ == nullptr) {
+      return;
+    }
+    uint32_t timeout_ms = 0;
+    SlirpPollSet poll_set;
+    slirp_pollfds_fill(slirp_, &timeout_ms, &VirtioNet::slirp_add_poll_cb, &poll_set);
+    int rc = 0;
+    if (!poll_set.fds.empty()) {
+      rc = poll(poll_set.fds.data(), static_cast<nfds_t>(poll_set.fds.size()), 0);
+      if (rc < 0 && errno == EINTR) {
+        rc = 0;
+      }
+    }
+    slirp_pollfds_poll(slirp_, rc < 0 ? 1 : 0, &VirtioNet::slirp_get_revents_cb, &poll_set);
+#endif
+  }
+
+  void enqueue_slirp_rx(const uint8_t* data, size_t len) {
+    if (data == nullptr || len == 0) {
+      return;
+    }
+    slirp_rx_frames_.emplace_back(data, data + len);
+  }
+
+  void flush_slirp_rx() {
+    while (!slirp_rx_frames_.empty()) {
+      const std::vector<uint8_t>& frame = slirp_rx_frames_.front();
+      if (!inject_rx_frame(frame.data(), frame.size())) {
+        return;
+      }
+      slirp_rx_frames_.pop_front();
+    }
+  }
+
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+  static short poll_events_from_slirp(int events) {
+    short out = 0;
+    if (events & SLIRP_POLL_IN) out |= POLLIN;
+    if (events & SLIRP_POLL_OUT) out |= POLLOUT;
+    if (events & SLIRP_POLL_PRI) out |= POLLPRI;
+    if (events & SLIRP_POLL_ERR) out |= POLLERR;
+    if (events & SLIRP_POLL_HUP) out |= POLLHUP;
+    return out;
+  }
+
+  static int slirp_events_from_poll(short events) {
+    int out = 0;
+    if (events & POLLIN) out |= SLIRP_POLL_IN;
+    if (events & POLLOUT) out |= SLIRP_POLL_OUT;
+    if (events & POLLPRI) out |= SLIRP_POLL_PRI;
+    if (events & POLLERR) out |= SLIRP_POLL_ERR;
+    if (events & POLLHUP) out |= SLIRP_POLL_HUP;
+    return out;
+  }
+
+  static int slirp_add_poll_cb(int fd, int events, void* opaque) {
+    auto* set = static_cast<SlirpPollSet*>(opaque);
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = poll_events_from_slirp(events);
+    set->fds.push_back(pfd);
+    return static_cast<int>(set->fds.size() - 1);
+  }
+
+  static int slirp_get_revents_cb(int index, void* opaque) {
+    auto* set = static_cast<SlirpPollSet*>(opaque);
+    if (index < 0 || static_cast<size_t>(index) >= set->fds.size()) {
+      return 0;
+    }
+    return slirp_events_from_poll(set->fds[static_cast<size_t>(index)].revents);
+  }
+
+  static ssize_t slirp_send_packet_cb(const void* buf, size_t len, void* opaque) {
+    auto* self = static_cast<VirtioNet*>(opaque);
+    if (buf == nullptr || len == 0) {
+      return 0;
+    }
+    if (len < 60) {
+      uint8_t padded[64]{};
+      memcpy(padded, buf, len);
+      self->enqueue_slirp_rx(padded, 60);
+      return static_cast<ssize_t>(len);
+    }
+    self->enqueue_slirp_rx(static_cast<const uint8_t*>(buf), len);
+    return static_cast<ssize_t>(len);
+  }
+
+  static void slirp_guest_error_cb(const char* msg, void* /*opaque*/) {
+    if (msg != nullptr) {
+      fprintf(stderr, "[node-vmm kvm] slirp guest error: %s\n", msg);
+    }
+  }
+
+  static int64_t slirp_clock_get_ns_cb(void* /*opaque*/) {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t(ts.tv_sec) * 1000000000LL + int64_t(ts.tv_nsec);
+  }
+
+  static void slirp_notify_cb(void* /*opaque*/) {}
+
+  static void slirp_register_poll_fd_cb(int /*fd*/, void* opaque) {
+    slirp_notify_cb(opaque);
+  }
+
+  static void slirp_unregister_poll_fd_cb(int /*fd*/, void* opaque) {
+    slirp_notify_cb(opaque);
+  }
+#endif
+
   KvmSystem& sys_;
   GuestMemory mem_;
   uint64_t mmio_base_{0};
@@ -2442,6 +2705,11 @@ class VirtioNet {
   uint32_t queue_sel_{0};
   uint32_t interrupt_status_{0};
   Queue queues_[2];
+  std::deque<std::vector<uint8_t>> slirp_rx_frames_;
+#ifdef NODE_VMM_HAVE_LIBSLIRP
+  ::Slirp* slirp_{nullptr};
+  SlirpCb slirp_cb_{};
+#endif
 };
 
 void HandleIo(struct kvm_run* run, Uart& uart, GuestExit* guest_exit = nullptr) {
@@ -2692,6 +2960,43 @@ std::vector<AttachedDiskConfig> GetAttachedDisks(napi_env env, napi_value obj) {
     Check(!disk.path.empty(), std::string(name) + " entries require path");
     disk.read_only = GetBool(env, entry, "readOnly", GetBool(env, entry, "readonly", false));
     out.push_back(std::move(disk));
+  }
+  return out;
+}
+
+uint32_t ParseIpv4HostOrder(const std::string& input, const std::string& label) {
+  in_addr addr {};
+  Check(inet_pton(AF_INET, input.c_str(), &addr) == 1, "invalid IPv4 address for " + label + ": " + input);
+  return ntohl(addr.s_addr);
+}
+
+std::vector<SlirpHostFwdConfig> GetSlirpHostFwds(napi_env env, napi_value obj) {
+  if (!HasNonNullishNamed(env, obj, "netSlirpHostFwds")) {
+    return {};
+  }
+  napi_value value = GetNamed(env, obj, "netSlirpHostFwds");
+  bool is_array = false;
+  napi_is_array(env, value, &is_array);
+  Check(is_array, "netSlirpHostFwds must be an array");
+
+  uint32_t length = 0;
+  napi_get_array_length(env, value, &length);
+  std::vector<SlirpHostFwdConfig> out;
+  out.reserve(length);
+  for (uint32_t i = 0; i < length; i++) {
+    napi_value entry;
+    napi_get_element(env, value, i, &entry);
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, entry, &type);
+    Check(type == napi_object, "netSlirpHostFwds entries must be objects");
+    SlirpHostFwdConfig fwd;
+    fwd.udp = GetBool(env, entry, "udp", false);
+    fwd.host_ip = ParseIpv4HostOrder(GetString(env, entry, "hostAddr", "127.0.0.1"), "netSlirpHostFwds.hostAddr");
+    fwd.host_port = static_cast<uint16_t>(GetUint32(env, entry, "hostPort", 0));
+    fwd.guest_port = static_cast<uint16_t>(GetUint32(env, entry, "guestPort", 0));
+    Check(fwd.host_port > 0, "netSlirpHostFwds entries require hostPort");
+    Check(fwd.guest_port > 0, "netSlirpHostFwds entries require guestPort");
+    out.push_back(fwd);
   }
   return out;
 }
@@ -3174,10 +3479,16 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     bool interactive = GetBool(env, argv[0], "interactive", false);
     std::string tap_name = GetString(env, argv[0], "netTapName");
     std::string guest_mac = GetString(env, argv[0], "netGuestMac");
+    bool slirp_enabled = GetBool(env, argv[0], "netSlirpEnabled", false);
+    std::string slirp_host_ip = GetString(env, argv[0], "netHostIp", "10.0.2.2");
+    std::string slirp_guest_ip = GetString(env, argv[0], "netGuestIp", "10.0.2.15");
+    std::string slirp_netmask = GetString(env, argv[0], "netNetmask", "255.255.255.0");
+    std::string slirp_dns = GetString(env, argv[0], "netDns", "10.0.2.3");
+    std::vector<SlirpHostFwdConfig> slirp_host_fwds = GetSlirpHostFwds(env, argv[0]);
     std::vector<AttachedDiskConfig> attached_disks = GetAttachedDisks(env, argv[0]);
     RunControl control = GetRunControl(env, argv[0]);
     control.set_state(kControlStateStarting);
-    bool network_enabled = !tap_name.empty();
+    bool network_enabled = !tap_name.empty() || slirp_enabled;
     Check(attached_disks.size() < kMaxIoApicPins, "too many attached disks");
     uint32_t disk_count = static_cast<uint32_t>(attached_disks.size() + 1);
     CheckVirtioMmioDeviceCount(disk_count + (network_enabled ? 1 : 0));
@@ -3185,7 +3496,8 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     Check(!rootfs_path.empty(), "rootfsPath is required");
     Check(!cmdline.empty(), "cmdline is required");
     Check(cpus >= 1 && cpus <= kMaxVcpus, "cpus must be between 1 and 64");
-    Check(!network_enabled || !guest_mac.empty(), "netGuestMac is required when netTapName is set");
+    Check(!(slirp_enabled && !tap_name.empty()), "netSlirpEnabled cannot be combined with netTapName");
+    Check(!network_enabled || !guest_mac.empty(), "netGuestMac is required when networking is enabled");
     Check(cmdline.size() + 1 <= kKernelCmdlineMax, "kernel cmdline is too long");
 
     KvmSystem sys = CreateVm(mem_mib, true);
@@ -3210,7 +3522,18 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     if (network_enabled) {
       uint32_t net_index = disk_count;
       net = std::make_unique<VirtioNet>(
-          sys, mem, VirtioMmioBase(net_index), VirtioMmioIrq(net_index), tap_name, guest_mac);
+          sys,
+          mem,
+          VirtioMmioBase(net_index),
+          VirtioMmioIrq(net_index),
+          tap_name,
+          guest_mac,
+          slirp_enabled,
+          slirp_host_ip,
+          slirp_guest_ip,
+          slirp_netmask,
+          slirp_dns,
+          slirp_host_fwds);
     }
 
     std::vector<Vcpu> vcpus;

@@ -319,6 +319,8 @@ Linux/KVM runtime:
 - Linux x64 npm installs use the bundled native prebuild by default
 - `python3`, `make`, and `g++` are only needed when forcing or falling back to a
   local `node-gyp` build
+- `libslirp-dev` and `libglib2.0-dev` are needed when forcing a local build
+  that should support `network: "slirp"` / `--net slirp`
 - `mkfs.ext4`, `mount`, `umount`, `truncate`, `install`
 - `ip`, `iptables`, `sysctl` for `network: "auto"` / `--net auto`
 - `git` for `--repo` / SDK repo builds
@@ -385,8 +387,8 @@ macOS/HVF runtime:
 | Run `--image alpine:3.20` from cache | Yes | Yes | Yes | Cache must already contain the prepared rootfs |
 | Run unsupported `--image ...` from cold cache | Yes | Yes, with WSL2 | Yes, when the OCI image has arm64 layers | OCI network access and ext4 builder |
 | Interactive shell / getty console | Yes | Yes | Yes | Host terminal |
-| `apk add`, DNS, outbound network | Yes | Yes | Yes | Linux TAP/NAT or Slirp on Windows/macOS |
-| TCP port forwarding | Yes | Yes | Yes | Linux TAP/NAT or Slirp on Windows/macOS |
+| `apk add`, DNS, outbound network | Yes | Yes | Yes | Linux TAP/NAT or explicit Slirp; Slirp on Windows/macOS |
+| TCP port forwarding | Yes | Yes | Yes | Linux TAP/NAT or explicit Slirp; Slirp on Windows/macOS |
 | Pause, resume, stop | Yes | Yes | Yes | Native backend |
 | RNG device for guest entropy | Yes | Yes | Host kernel entropy path | Native backend |
 | Multi-vCPU native runner | Yes | Yes | Yes | Full Linux guest SMP parity remains backend work |
@@ -400,7 +402,8 @@ macOS/HVF runtime:
 
 Yes, VM execution can run without `sudo` when the host user can open `/dev/kvm`
 and the VM does not need root-only setup. The root-only parts are rootfs
-creation/mounting and `--net auto`.
+creation/mounting and `--net auto`; `--net slirp` avoids TAP/iptables setup when
+the Linux native addon was built with libslirp.
 
 One simple workflow is:
 

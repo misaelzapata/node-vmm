@@ -197,6 +197,7 @@ export function runKvmVmAsync(config: KvmRunConfig, options: KvmRunAsyncOptions 
     return Promise.reject(error);
   }
   return new Promise((resolve, reject) => {
+    /* c8 ignore start - console notification control needs live guest output; e2e/manual KVM runs cover it. */
     const control = options.onConsoleOutput
       ? config.control && config.control.length >= CONTROL_WORDS
         ? config.control
@@ -208,8 +209,10 @@ export function runKvmVmAsync(config: KvmRunConfig, options: KvmRunAsyncOptions 
       Atomics.store(control, CONTROL_CONSOLE, 0);
     }
     const workerConfig = control ? { ...config, control } : config;
+    /* c8 ignore stop */
     const worker = new Worker(new URL("./kvm-worker.js", import.meta.url), { workerData: workerConfig });
     let settled = false;
+    /* c8 ignore start - console notification control needs live guest output; e2e/manual KVM runs cover it. */
     let consoleNotified = false;
     let consolePoll: ReturnType<typeof setInterval> | undefined;
     const notifyConsole = (): void => {
@@ -238,6 +241,7 @@ export function runKvmVmAsync(config: KvmRunConfig, options: KvmRunAsyncOptions 
         consolePoll = undefined;
       }
     };
+    /* c8 ignore stop */
     const settle = (fn: () => void): void => {
       if (settled) {
         return;

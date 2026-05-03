@@ -25,9 +25,9 @@ if (!required && !force && existsSync(prebuild)) {
   process.exit(0);
 }
 
-// Detect libslirp via vcpkg so the WHP backend can pull in virtio-net + slirp
-// when available. The binding.gyp side reads NODE_VMM_HAVE_LIBSLIRP and
-// NODE_VMM_LIBSLIRP_ROOT off the spawn environment.
+// Detect libslirp so WHP and KVM can pull in virtio-net + slirp when
+// available. The binding.gyp side reads NODE_VMM_HAVE_LIBSLIRP and
+// platform-specific include/link flags off the spawn environment.
 const env = { ...process.env };
 if (process.platform === "win32") {
   // Prefer the project-vendored libslirp (third_party/libslirp), populated by
@@ -49,6 +49,21 @@ if (process.platform === "win32") {
     env.NODE_VMM_LIBSLIRP_BIN = c.binDir;
     process.stdout.write(`node-vmm native build: linking libslirp (${c.label}) from ${c.root}\n`);
     break;
+  }
+}
+if (process.platform === "linux") {
+  const exists = spawnSync("pkg-config", ["--exists", "slirp"], { stdio: "ignore" });
+  if ((exists.status ?? 1) === 0) {
+    const cflags = spawnSync("pkg-config", ["--cflags", "slirp"], { encoding: "utf8" });
+    const libs = spawnSync("pkg-config", ["--libs", "slirp"], { encoding: "utf8" });
+    if ((cflags.status ?? 1) === 0 && (libs.status ?? 1) === 0) {
+      env.NODE_VMM_HAVE_LIBSLIRP = "1";
+      env.NODE_VMM_LIBSLIRP_CFLAGS = cflags.stdout.trim();
+      env.NODE_VMM_LIBSLIRP_LIBS = libs.stdout.trim();
+      process.stdout.write("node-vmm native build: linking libslirp from pkg-config\n");
+    }
+  } else {
+    process.stdout.write("node-vmm native build: libslirp not found; Linux --net slirp will be unavailable\n");
   }
 }
 

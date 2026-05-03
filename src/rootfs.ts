@@ -175,7 +175,7 @@ export function renderInitScript(options: {
   # inner shell exits with status 0 (no -i, no input pending). When the user
   # asked for the default interactive shell, exec '/bin/sh -i' so the shell
   # blocks on read. Otherwise honour the explicit command (htop, vim, etc).
-${renderInteractiveLoginScript()}${renderWindowsConsoleInteractiveBlock()}${renderSerialGettyInteractiveBlock()}${renderLinuxPtyInteractiveBlock()}${renderFallbackInteractiveBlock()}  # End backend-specific interactive console selection.
+${renderInteractiveLoginScript()}${renderWindowsConsoleInteractiveBlock()}${renderLinuxPtyInteractiveBlock()}${renderSerialGettyInteractiveBlock()}${renderFallbackInteractiveBlock()}  # End backend-specific interactive console selection.
   status=$?
   printf '%s\\n' "$status" > /node-vmm/status 2>/dev/null || true
   node_vmm_log "[node-vmm] command exited with status $status"

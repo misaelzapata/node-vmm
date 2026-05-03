@@ -137,7 +137,7 @@ export function capabilitiesForHost(host: Partial<HostPlatformInfo> = {}): HostC
       rootfsBuild: true,
       prebuiltRootfs: true,
       defaultNetwork: "auto",
-      networkModes: ["auto", "none", "tap"],
+      networkModes: ["auto", "none", "tap", "slirp"],
       tapNetwork: true,
       portForwarding: true,
       minCpus: 1,
@@ -265,7 +265,7 @@ function featureLines(capabilities = hostCapabilities()): string[] {
         ? "network: virtio-mmio net with libslirp via --net auto/--net slirp; TCP publish supported"
         : backend === "hvf"
           ? "network: virtio-mmio net with libslirp via --net auto/--net slirp; TCP publish supported"
-          : "network: virtio-mmio net with TAP/NAT via --net auto; TCP publish supported"
+          : "network: virtio-mmio net with TAP/NAT via --net auto or libslirp via --net slirp; TCP publish supported"
       : "network: none by default; WHP networking, TAP, and TCP publish are not available yet",
     backend === "whp"
       ? "snapshot: rootfs snapshot bundles and WHP dirty-page probes; RAM/device restore still pending"
@@ -1391,7 +1391,7 @@ export async function runImage(
         options.cmdline,
         options.bootArgs,
         [
-          network.mode === "slirp" && capabilities.backend !== "hvf"
+          network.mode !== "none" && capabilities.backend !== "hvf"
             ? virtioNetKernelArg(attachedDisks.length, capabilities.backend)
             : undefined,
           network.kernelIpArg,
@@ -1541,7 +1541,7 @@ export async function startVm(
         options.cmdline,
         options.bootArgs,
         [
-          network.mode === "slirp" && capabilities.backend !== "hvf"
+          network.mode !== "none" && capabilities.backend !== "hvf"
             ? virtioNetKernelArg(attachedDisks.length, capabilities.backend)
             : undefined,
           network.kernelIpArg,
@@ -1695,7 +1695,7 @@ export async function bootRootfs(
         options.cmdline,
         options.bootArgs,
         [
-          network.mode === "slirp" && capabilities.backend !== "hvf"
+          network.mode !== "none" && capabilities.backend !== "hvf"
             ? virtioNetKernelArg(attachedDisks.length, capabilities.backend)
             : undefined,
           network.kernelIpArg,
