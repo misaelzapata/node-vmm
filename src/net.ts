@@ -399,7 +399,6 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
       netmask,
       cidrPrefix: 30,
       dns,
-      kernelIpArg: `ip=${guestIp}::${hostIp}:${netmask}:node-vmm:eth0:off`,
       kernelNetArgs: `node_vmm.iface=eth0 node_vmm.ip=${guestIp}/30 node_vmm.gw=${hostIp} node_vmm.dns=${dns}`,
       ports: portForwards.ports,
       cleanup: cleanupAuto,

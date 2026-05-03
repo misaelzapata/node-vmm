@@ -82,7 +82,9 @@ node dist/src/main.js run \
   --net none
 ```
 
-Rootless runs must avoid rootfs building/mounting and `--net auto`.
+Rootless runs must avoid rootfs building/mounting and `--net auto`. `--net
+slirp` avoids TAP/iptables setup when the Linux native addon was built with
+libslirp.
 
 ## Port Publishing Smoke
 
@@ -99,6 +101,19 @@ sudo -n node dist/src/main.js run \
   --timeout-ms 30000
 
 curl http://127.0.0.1:18080
+```
+
+Linux/KVM also supports explicit libslirp user-mode networking:
+
+```bash
+sudo -n node dist/src/main.js run \
+  --image node:22-alpine \
+  --cmd "node -e \"require('node:http').createServer((_, r) => r.end('ok\\n')).listen(3000, '0.0.0.0')\"" \
+  --net slirp \
+  -p 18081:3000 \
+  --timeout-ms 30000
+
+curl http://127.0.0.1:18081
 ```
 
 `-p 3000`, `-p 18080:3000`, and

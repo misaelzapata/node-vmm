@@ -18,7 +18,14 @@
             "-fstack-protector-strong",
             "-D_FORTIFY_SOURCE=2"
           ],
-          "ldflags": ["-Wl,-z,relro", "-Wl,-z,now", "-Wl,-z,noexecstack"]
+          "ldflags": ["-Wl,-z,relro", "-Wl,-z,now", "-Wl,-z,noexecstack"],
+          "conditions": [
+            ["\"<!(node -e \"process.stdout.write(process.env.NODE_VMM_HAVE_LIBSLIRP || '')\")\"=='1'", {
+              "defines+": ["NODE_VMM_HAVE_LIBSLIRP"],
+              "cflags_cc+": ["<!@(node -e \"process.stdout.write(process.env.NODE_VMM_LIBSLIRP_CFLAGS || '')\")"],
+              "libraries+": ["<!@(node -e \"process.stdout.write(process.env.NODE_VMM_LIBSLIRP_LIBS || '')\")"]
+            }]
+          ]
         }],
         ["OS=='win'", {
           "sources": [

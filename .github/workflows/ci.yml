@@ -19,6 +19,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y libslirp-dev libglib2.0-dev
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm run test:unit
@@ -101,6 +102,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y libslirp-dev libglib2.0-dev
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: node --test dist/test/native.test.js

@@ -127,7 +127,7 @@ Common flags:
   --mem MIB             guest memory (default: 256)
   --cpus N              vCPU count, 1-64 (default: 1)
   --net auto|none|tap|slirp
-                        network mode (default: auto; WHP auto resolves to slirp)
+                        network mode (default: auto; WHP/HVF auto resolves to slirp)
   --tap NAME            existing/created TAP name for --net tap or auto
   -p, --publish SPEC    Docker-style TCP publish: [IP:]HOST:CONTAINER[/tcp]
   --port SPEC           alias for --publish, repeatable

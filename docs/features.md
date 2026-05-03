@@ -21,7 +21,7 @@ sub-100ms warm starts.
 | Dockerfile rootfs | Available on Linux/KVM | Dockerfile and repo rootfs builds still require Linux. |
 | Git repository builds | Available on Linux/KVM | `--repo`, `--ref`, and `--subdir` clone to temp storage before build. |
 | JavaScript app servers | Available on Linux/KVM; WHP/HVF runtime smoke | Linux release gate covers Dockerfile-built plain Node, Express, Fastify, Next.js, Vite React, and Vite Vue. WHP smoke covers the same app families built inside `node:22-alpine`; HVF covers Node image/runtime and port publishing on ARM64. |
-| Docker-style TCP ports | Available | Linux/KVM uses TAP/NAT; Windows/WHP and macOS/HVF use libslirp host forwarding. |
+| Docker-style TCP ports | Available | Linux/KVM supports TAP/NAT through `--net auto` and user-mode libslirp through `--net slirp`; Windows/WHP and macOS/HVF use libslirp host forwarding. |
 | Rootless run from prepared disk | Available | Linux/KVM works with `/dev/kvm` access and `--net none`; WHP runs without Linux sudo; HVF runs as a signed normal user process. |
 | Live VM handle | Available | `startVm()`, `pause()`, `resume()`, `stop()`, `wait()`. WHP and HVF lifecycle paths are covered by native tests. |
 | Prepared sandbox exec | Available | `createSandbox().process.exec()` reuses a rootfs but boots per exec today. |
@@ -54,7 +54,7 @@ sub-100ms warm starts.
 | Real rootfs boot | Available | Available locally through WSL2-built OCI rootfs images; full e2e gated by `NODE_VMM_WHP_FULL_E2E=1` | Available through local ARM64 OCI rootfs build; covered by `npm run test:macos-hvf` |
 | Prebuilt rootfs boot | Available for x86_64 assets | Available for published x86_64 release assets; no WSL2 required when fetch/checksum succeeds or the cache already has the rootfs | Planned for future ARM64 assets; current x86_64 assets are intentionally skipped |
 | Virtio block/rootfs | Available | Available with sparse overlay support | Available with sparse overlay support |
-| Networking and port publishing | TAP/NAT and Docker-style TCP publish | libslirp user-mode networking and host forwarding | libslirp user-mode networking and host forwarding by default; vmnet/socket_vmnet optional |
+| Networking and port publishing | TAP/NAT by default, plus explicit libslirp user-mode networking and host forwarding | libslirp user-mode networking and host forwarding | libslirp user-mode networking and host forwarding by default; vmnet/socket_vmnet optional |
 | Interactive console | UART/PTY helper | UART/PTY helper; idle CPU and guest Ctrl-C covered by WHP e2e | PL011 `/dev/ttyAMA0`; boot loading, TTY size, and guest Ctrl-C covered by HVF e2e |
 | Guest entropy | `/dev/random`, `/dev/urandom`, host kernel RNG | plus virtio-rng `/dev/hwrng` on WHP | host kernel entropy path through the ARM64 guest |
 | SMP | 1-64 vCPUs | 1-64 vCPUs | 1-64 vCPUs through PSCI |

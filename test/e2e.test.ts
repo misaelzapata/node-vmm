@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import http from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -28,6 +30,81 @@ async function removeTempTree(target: string): Promise<void> {
       throw error;
     }
   }
+}
+
+async function freeTcpPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  assert(address && typeof address !== "string");
+  return address.port;
+}
+
+function requestText(port: number, timeoutMs = 1000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      { host: "127.0.0.1", port, path: "/", method: "GET", agent: false, timeout: timeoutMs },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+        });
+        response.on("end", () => resolve(body));
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("request timed out")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function waitHttpText(port: number, marker: string, timeoutMs = 120_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const body = await requestText(port);
+      if (body.includes(marker)) {
+        return body;
+      }
+      lastError = new Error(`HTTP body did not include ${marker}: ${body.slice(0, 200)}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw lastError instanceof Error ? lastError : new Error(`HTTP did not become ready on ${port}`);
+}
+
+function waitForChild(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<{ code: number | null; output: string }> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`child did not exit within ${timeoutMs}ms\n${output}`));
+    }, timeoutMs);
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.stderr?.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, output });
+    });
+  });
 }
 
 async function buildLocalBusyboxRootfs(tempDir: string, mode: "batch" | "interactive" = "interactive"): Promise<string> {
@@ -99,7 +176,7 @@ import sys
 import time
 
 cmd = sys.argv[1:]
-send_input = os.environ.get("NODE_VMM_E2E_PTY_INPUT", "echo e2e-console-ok\nexit\n").encode()
+send_input = os.environ.get("NODE_VMM_E2E_PTY_INPUT", "echo e2e-console-ok\r\nexit\r\n").encode()
 expect = os.environ.get("NODE_VMM_E2E_PTY_EXPECT", "e2e-console-ok").encode()
 master, slave = pty.openpty()
 proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
@@ -200,6 +277,7 @@ test("e2e interactive shell accepts input and exits", { skip: !E2E_ENABLED }, as
         kernel,
         "--cmd",
         "/bin/sh",
+        "--interactive",
         "--mem",
         "256",
         "--net",
@@ -314,6 +392,63 @@ test("e2e exposes requested vCPUs to Linux guests", { skip: !E2E_ENABLED }, asyn
     assert.match(output, /(^|\n)2(\r?\n)/);
     assert.match(output, /stopped:/);
   } finally {
+    await removeTempTree(tempDir);
+  }
+});
+
+test("e2e KVM slirp publishes a guest HTTP port", { skip: !E2E_ENABLED }, async () => {
+  const kernel = await requireKernelPath();
+  assert.equal(existsSync(kernel), true, `kernel not found: ${kernel}`);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-e2e-slirp-"));
+  const hostPort = await freeTcpPort();
+  const marker = "linux-slirp-port-ok";
+  const command =
+    "node -e \"const http=require('node:http'); " +
+    "const server=http.createServer((_req,res)=>res.end('linux-slirp-port-ok\\n',()=>server.close(()=>process.exit(0)))); " +
+    "server.listen(3000,'0.0.0.0')\"";
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    child = spawn(
+      "sudo",
+      [
+        "-n",
+        "env",
+        `NODE_VMM_KERNEL=${kernel}`,
+        `PATH=${process.env.PATH || ""}`,
+        "node",
+        "dist/src/main.js",
+        "run",
+        "--image",
+        "node:22-alpine",
+        "--disk",
+        "768",
+        "--cache-dir",
+        path.join(tempDir, "oci-cache"),
+        "--kernel",
+        kernel,
+        "--cmd",
+        command,
+        "--mem",
+        "512",
+        "--net",
+        "slirp",
+        "--publish",
+        `${hostPort}:3000`,
+        "--timeout-ms",
+        "120000",
+      ],
+      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const childDone = waitForChild(child, 180_000);
+    const body = await waitHttpText(hostPort, marker);
+    assert.match(body, new RegExp(marker));
+    const result = await childDone;
+    assert.equal(result.code, 0, result.output);
+    assert.match(result.output, /stopped:/);
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+    }
     await removeTempTree(tempDir);
   }
 });
