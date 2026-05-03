@@ -1,6 +1,6 @@
 [
   {
-    "file": "native/kvm_backend.cc",
+    "file": "native/kvm/backend.cc",
     "start": 1,
     "end": 2511,
     "reason": "Native KVM, MMIO, virtio, errno, and kernel-dependent defensive paths require privileged hardware/system states. The release gate still runs native smoke tests, e2e KVM, and gcov; uncovered native lines must remain visible here until smaller unit seams are introduced."

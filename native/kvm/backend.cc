@@ -26,11 +26,13 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef MFD_CLOEXEC
@@ -42,11 +44,10 @@ namespace {
 constexpr uint64_t kBootParamsAddr = 0x7000;
 constexpr uint64_t kPageTableBase = 0x9000;
 constexpr uint64_t kCmdlineAddr = 0x20000;
-constexpr uint64_t kVirtioBlkBase = 0xD0000000;
-constexpr uint64_t kVirtioNetBase = 0xD0001000;
+constexpr uint64_t kVirtioMmioBase = 0xD0000000;
 constexpr uint64_t kVirtioStride = 0x1000;
-constexpr uint32_t kVirtioBlkIRQ = 5;
-constexpr uint32_t kVirtioNetIRQ = 6;
+constexpr uint32_t kVirtioMmioIrqBase = 5;
+constexpr uint32_t kMaxIoApicPins = 24;
 constexpr uint16_t kCom1Base = 0x3F8;
 constexpr uint32_t kCom1IRQ = 4;
 constexpr uint16_t kNodeVmmExitPort = 0x501;
@@ -66,6 +67,14 @@ constexpr int32_t kControlStatePaused = 2;
 constexpr int32_t kControlStateStopping = 3;
 constexpr int32_t kControlStateExited = 4;
 
+constexpr uint64_t VirtioMmioBase(uint32_t index) {
+  return kVirtioMmioBase + uint64_t(index) * kVirtioStride;
+}
+
+constexpr uint32_t VirtioMmioIrq(uint32_t index) {
+  return kVirtioMmioIrqBase + index;
+}
+
 std::string ErrnoMessage(const std::string& what) {
   return what + ": " + strerror(errno);
 }
@@ -74,6 +83,18 @@ void Check(bool ok, const std::string& message) {
   if (!ok) {
     throw std::runtime_error(message);
   }
+}
+
+void CheckVirtioMmioDeviceCount(size_t count) {
+  Check(count > 0, "at least one virtio-mmio device is required");
+  Check(kVirtioMmioIrqBase + count - 1 < kMaxIoApicPins, "too many virtio-mmio devices");
+}
+
+std::string VirtioMmioDeviceName(uint32_t index) {
+  Check(index <= 999, "too many virtio-mmio devices");
+  char name[5];
+  snprintf(name, sizeof(name), "V%03u", index);
+  return std::string(name, 4);
 }
 
 void CheckErr(int rc, const std::string& what) {
@@ -1170,11 +1191,17 @@ std::vector<uint8_t> BuildVirtioMmioDevice(const std::string& name, uint32_t uid
   return AppendDevice(name, dev_children);
 }
 
-std::vector<uint8_t> BuildDsdtBody(bool network_enabled) {
+std::vector<uint8_t> BuildDsdtBody(bool network_enabled, uint32_t disk_count) {
+  CheckVirtioMmioDeviceCount(disk_count + (network_enabled ? 1 : 0));
   std::vector<std::vector<uint8_t>> children;
-  children.push_back(BuildVirtioMmioDevice("V000", 0, kVirtioBlkBase, kVirtioBlkIRQ));
+  for (uint32_t index = 0; index < disk_count; index++) {
+    children.push_back(BuildVirtioMmioDevice(
+        VirtioMmioDeviceName(index), index, VirtioMmioBase(index), VirtioMmioIrq(index)));
+  }
   if (network_enabled) {
-    children.push_back(BuildVirtioMmioDevice("V001", 1, kVirtioNetBase, kVirtioNetIRQ));
+    uint32_t net_index = disk_count;
+    children.push_back(BuildVirtioMmioDevice(
+        VirtioMmioDeviceName(net_index), net_index, VirtioMmioBase(net_index), VirtioMmioIrq(net_index)));
   }
   return AppendScope("\\_SB_", children);
 }
@@ -1202,8 +1229,8 @@ void FinalizeSdt(std::vector<uint8_t>& table) {
   table[9] = TableChecksum(table);
 }
 
-std::vector<uint8_t> BuildDsdtTable(bool network_enabled) {
-  auto body = BuildDsdtBody(network_enabled);
+std::vector<uint8_t> BuildDsdtTable(bool network_enabled, uint32_t disk_count) {
+  auto body = BuildDsdtBody(network_enabled, disk_count);
   auto out = BuildSdtHeader("DSDT", static_cast<uint32_t>(36 + body.size()), 2, "GCDSDT01");
   out.insert(out.end(), body.begin(), body.end());
   FinalizeSdt(out);
@@ -1286,7 +1313,7 @@ std::vector<uint8_t> BuildRsdp(uint64_t rsdt_addr, uint64_t xsdt_addr) {
   return out;
 }
 
-uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled, int cpus) {
+uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled, int cpus, uint32_t disk_count) {
   constexpr uint64_t rsdp_addr = 0x000E0000;
   uint64_t cursor = 0x000A0000;
   auto write_table = [&](const std::vector<uint8_t>& table) {
@@ -1297,7 +1324,7 @@ uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled, int cpus) {
     Check(cursor < rsdp_addr, "ACPI tables overflow low memory");
     return addr;
   };
-  auto dsdt = BuildDsdtTable(network_enabled);
+  auto dsdt = BuildDsdtTable(network_enabled, disk_count);
   uint64_t dsdt_addr = write_table(dsdt);
   uint64_t fadt_addr = write_table(BuildFadt(dsdt_addr));
   uint64_t madt_addr = write_table(BuildMadt(cpus));
@@ -1311,25 +1338,26 @@ uint64_t CreateAcpiTables(GuestMemory mem, bool network_enabled, int cpus) {
 struct IRQRoutingTable {
   uint32_t nr;
   uint32_t flags;
-  struct kvm_irq_routing_entry entries[32];
+  struct kvm_irq_routing_entry entries[64];
 };
 
 void SetIrqRouting(KvmSystem& sys) {
   IRQRoutingTable table {};
-  for (uint32_t irq = 0; irq < 16; irq++) {
-    uint32_t pic_index = irq * 2;
-    uint32_t ioapic_index = pic_index + 1;
-    table.entries[pic_index].gsi = irq;
-    table.entries[pic_index].type = KVM_IRQ_ROUTING_IRQCHIP;
-    table.entries[pic_index].u.irqchip.irqchip = irq < 8 ? KVM_IRQCHIP_PIC_MASTER : KVM_IRQCHIP_PIC_SLAVE;
-    table.entries[pic_index].u.irqchip.pin = irq < 8 ? irq : irq - 8;
+  for (uint32_t irq = 0; irq < kMaxIoApicPins; irq++) {
+    if (irq < 16) {
+      struct kvm_irq_routing_entry& pic = table.entries[table.nr++];
+      pic.gsi = irq;
+      pic.type = KVM_IRQ_ROUTING_IRQCHIP;
+      pic.u.irqchip.irqchip = irq < 8 ? KVM_IRQCHIP_PIC_MASTER : KVM_IRQCHIP_PIC_SLAVE;
+      pic.u.irqchip.pin = irq < 8 ? irq : irq - 8;
+    }
 
-    table.entries[ioapic_index].gsi = irq;
-    table.entries[ioapic_index].type = KVM_IRQ_ROUTING_IRQCHIP;
-    table.entries[ioapic_index].u.irqchip.irqchip = KVM_IRQCHIP_IOAPIC;
-    table.entries[ioapic_index].u.irqchip.pin = irq;
+    struct kvm_irq_routing_entry& ioapic = table.entries[table.nr++];
+    ioapic.gsi = irq;
+    ioapic.type = KVM_IRQ_ROUTING_IRQCHIP;
+    ioapic.u.irqchip.irqchip = KVM_IRQCHIP_IOAPIC;
+    ioapic.u.irqchip.pin = irq;
   }
-  table.nr = 32;
   CheckErr(IoctlPtr(sys.vm.get(), KVM_SET_GSI_ROUTING, &table), "KVM_SET_GSI_ROUTING");
 }
 
@@ -1342,8 +1370,15 @@ void IrqLine(KvmSystem& sys, uint32_t irq, bool level) {
 
 class Uart {
  public:
-  explicit Uart(size_t limit, bool echo_stdout = true, KvmSystem* sys = nullptr)
-      : limit_(limit), echo_stdout_(echo_stdout), sys_(sys) {}
+  explicit Uart(
+      size_t limit,
+      bool echo_stdout = true,
+      KvmSystem* sys = nullptr,
+      std::function<void()> console_output_notify = {})
+      : limit_(limit),
+        echo_stdout_(echo_stdout),
+        sys_(sys),
+        console_output_notify_(std::move(console_output_notify)) {}
 
   uint8_t read(uint16_t offset) {
     bool dlab = (lcr_ & 0x80) != 0;
@@ -1471,6 +1506,8 @@ class Uart {
   size_t limit_{1024 * 1024};
   bool echo_stdout_{true};
   KvmSystem* sys_{nullptr};
+  bool console_output_seen_{false};
+  std::function<void()> console_output_notify_;
   std::string console_;
   char last_stdout_byte_{0};
 	  std::deque<uint8_t> rx_;
@@ -1501,6 +1538,12 @@ class Uart {
 	      console_.append(bytes.data(), std::min(available, bytes.size()));
 	    }
     if (echo_stdout_) {
+      if (!console_output_seen_) {
+        console_output_seen_ = true;
+        if (console_output_notify_) {
+          console_output_notify_();
+        }
+      }
       write_stdout(bytes);
     }
   }
@@ -1533,6 +1576,12 @@ class Uart {
   }
 
 	  void handle_tx_byte(uint8_t value) {
+    if (echo_stdout_) {
+      char byte = static_cast<char>(value);
+      std::lock_guard<std::mutex> lock(mu_);
+      emit_tx_locked(std::string(&byte, 1));
+      return;
+    }
     static const std::string query = "\x1b[6n";
     std::lock_guard<std::mutex> lock(mu_);
     if (!terminal_query_.empty() || value == 0x1B) {
@@ -1621,10 +1670,18 @@ struct DescChain {
 
 class VirtioBlk {
  public:
-  VirtioBlk(KvmSystem& sys, GuestMemory mem, const std::string& path, const std::string& overlay_path)
-      : sys_(sys), mem_(mem) {
+  VirtioBlk(
+      KvmSystem& sys,
+      GuestMemory mem,
+      uint64_t mmio_base,
+      uint32_t irq,
+      const std::string& path,
+      const std::string& overlay_path,
+      bool read_only)
+      : sys_(sys), mem_(mem), mmio_base_(mmio_base), irq_(irq), read_only_(read_only) {
     bool overlay = !overlay_path.empty();
-    int flags = overlay ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC);
+    Check(!(read_only_ && overlay), "read-only disk cannot use an overlay");
+    int flags = (overlay || read_only_) ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC);
     base_fd_.reset(open(path.c_str(), flags));
     CheckErr(base_fd_.get(), "open rootfs " + path);
     struct stat st {};
@@ -1642,9 +1699,11 @@ class VirtioBlk {
     queues_[0].size = kMaxQueueSize;
   }
 
+  uint64_t mmio_base() const { return mmio_base_; }
+
   void read_mmio(uint64_t addr, uint8_t* data, uint32_t len) {
     memset(data, 0, len);
-    uint32_t off = static_cast<uint32_t>(addr - kVirtioBlkBase);
+    uint32_t off = static_cast<uint32_t>(addr - mmio_base_);
     if (off < 0x100) {
       if (len != 4) {
         return;
@@ -1664,7 +1723,7 @@ class VirtioBlk {
   }
 
   void write_mmio(uint64_t addr, const uint8_t* data, uint32_t len) {
-    uint32_t off = static_cast<uint32_t>(addr - kVirtioBlkBase);
+    uint32_t off = static_cast<uint32_t>(addr - mmio_base_);
     if (off >= 0x100 || len != 4) {
       return;
     }
@@ -1693,6 +1752,9 @@ class VirtioBlk {
         return 0x554D4551;
       case 0x010: {
         uint64_t features = (1ULL << 32) | (1ULL << 9);
+        if (read_only_) {
+          features |= 1ULL << 5;
+        }
         return dev_features_sel_ == 1 ? uint32_t(features >> 32) : uint32_t(features);
       }
       case 0x034:
@@ -1743,13 +1805,13 @@ class VirtioBlk {
         if (value < 8 && queues_[value].ready) {
           handle_queue(queues_[value]);
           interrupt_status_ |= 1;
-          IrqLine(sys_, kVirtioBlkIRQ, true);
+          IrqLine(sys_, irq_, true);
         }
         break;
       case 0x064:
         interrupt_status_ &= ~value;
         if (interrupt_status_ == 0) {
-          IrqLine(sys_, kVirtioBlkIRQ, false);
+          IrqLine(sys_, irq_, false);
         }
         break;
       case 0x070:
@@ -1792,7 +1854,7 @@ class VirtioBlk {
     for (auto& q : queues_) {
       q = Queue {};
     }
-    IrqLine(sys_, kVirtioBlkIRQ, false);
+    IrqLine(sys_, irq_, false);
   }
 
   Desc read_desc(const Queue& q, uint16_t idx) {
@@ -1870,8 +1932,10 @@ class VirtioBlk {
 		          WriteDisk(sector, mem_.ptr(d.addr, d.len), d.len);
 	          sector += d.len / 512;
 	        }
-	      } else if (type == 4) {
-	        CheckErr(fsync(write_fd()), "virtio-blk flush");
+      } else if (type == 4) {
+	        if (!read_only_) {
+	          CheckErr(fsync(write_fd()), "virtio-blk flush");
+	        }
 	      } else if (type == 8) {
 	        const char id[] = "node-vmm";
 	        for (size_t i = 1; i + 1 < chain.size; i++) {
@@ -1971,6 +2035,7 @@ class VirtioBlk {
 	  }
 
 	  void WriteDisk(uint64_t sector, const uint8_t* src, size_t len) {
+	    Check(!read_only_, "virtio-blk write to read-only disk");
 	    uint64_t byte_off = CheckedMul(sector, 512, "virtio-blk write offset");
 	    CheckRange(disk_bytes_, byte_off, len, "virtio-blk write");
 	    prepare_partial_overlay_sectors(byte_off, len);
@@ -1980,6 +2045,9 @@ class VirtioBlk {
 
 	  KvmSystem& sys_;
 	  GuestMemory mem_;
+	  uint64_t mmio_base_{0};
+	  uint32_t irq_{0};
+	  bool read_only_{false};
 	  Fd base_fd_;
 	  Fd overlay_fd_;
 	  std::vector<uint8_t> dirty_sectors_;
@@ -2018,15 +2086,23 @@ Fd OpenTap(const std::string& tap_name) {
 
 class VirtioNet {
  public:
-  VirtioNet(KvmSystem& sys, GuestMemory mem, const std::string& tap_name, const std::string& mac)
-      : sys_(sys), mem_(mem), tap_(OpenTap(tap_name)), mac_(ParseMac(mac)) {
+  VirtioNet(
+      KvmSystem& sys,
+      GuestMemory mem,
+      uint64_t mmio_base,
+      uint32_t irq,
+      const std::string& tap_name,
+      const std::string& mac)
+      : sys_(sys), mem_(mem), mmio_base_(mmio_base), irq_(irq), tap_(OpenTap(tap_name)), mac_(ParseMac(mac)) {
     queues_[0].size = kMaxQueueSize;
     queues_[1].size = kMaxQueueSize;
   }
 
+  uint64_t mmio_base() const { return mmio_base_; }
+
   void read_mmio(uint64_t addr, uint8_t* data, uint32_t len) {
     memset(data, 0, len);
-    uint32_t off = static_cast<uint32_t>(addr - kVirtioNetBase);
+    uint32_t off = static_cast<uint32_t>(addr - mmio_base_);
     if (off < 0x100) {
       if (len != 4) {
         return;
@@ -2046,7 +2122,7 @@ class VirtioNet {
   }
 
   void write_mmio(uint64_t addr, const uint8_t* data, uint32_t len) {
-    uint32_t off = static_cast<uint32_t>(addr - kVirtioNetBase);
+    uint32_t off = static_cast<uint32_t>(addr - mmio_base_);
     if (off >= 0x100 || len != 4) {
       return;
     }
@@ -2168,7 +2244,7 @@ class VirtioNet {
       case 0x064:
         interrupt_status_ &= ~value;
         if (interrupt_status_ == 0) {
-          IrqLine(sys_, kVirtioNetIRQ, false);
+          IrqLine(sys_, irq_, false);
         }
         break;
       case 0x070:
@@ -2211,7 +2287,7 @@ class VirtioNet {
     for (auto& q : queues_) {
       q = Queue {};
     }
-    IrqLine(sys_, kVirtioNetIRQ, false);
+    IrqLine(sys_, irq_, false);
   }
 
   Desc read_desc(const Queue& q, uint16_t idx) {
@@ -2250,7 +2326,7 @@ class VirtioNet {
 
   void signal_queue() {
     interrupt_status_ |= 1;
-    IrqLine(sys_, kVirtioNetIRQ, true);
+    IrqLine(sys_, irq_, true);
   }
 
   bool has_rx_buffer(const Queue& q) const {
@@ -2355,6 +2431,8 @@ class VirtioNet {
 
   KvmSystem& sys_;
   GuestMemory mem_;
+  uint64_t mmio_base_{0};
+  uint32_t irq_{0};
   Fd tap_;
   std::array<uint8_t, 6> mac_;
   uint32_t status_{0};
@@ -2403,17 +2481,19 @@ void HandleIo(struct kvm_run* run, Uart& uart, GuestExit* guest_exit = nullptr) 
   }
 }
 
-bool HandleMmio(struct kvm_run* run, VirtioBlk& blk, VirtioNet* net) {
+bool HandleMmio(struct kvm_run* run, const std::vector<std::unique_ptr<VirtioBlk>>& blks, VirtioNet* net) {
   uint64_t addr = run->mmio.phys_addr;
-  if (addr >= kVirtioBlkBase && addr < kVirtioBlkBase + kVirtioStride) {
-    if (run->mmio.is_write) {
-      blk.write_mmio(addr, run->mmio.data, run->mmio.len);
-    } else {
-      blk.read_mmio(addr, run->mmio.data, run->mmio.len);
+  for (const auto& blk : blks) {
+    if (addr >= blk->mmio_base() && addr < blk->mmio_base() + kVirtioStride) {
+      if (run->mmio.is_write) {
+        blk->write_mmio(addr, run->mmio.data, run->mmio.len);
+      } else {
+        blk->read_mmio(addr, run->mmio.data, run->mmio.len);
+      }
+      return true;
     }
-    return true;
   }
-  if (net != nullptr && addr >= kVirtioNetBase && addr < kVirtioNetBase + kVirtioStride) {
+  if (net != nullptr && addr >= net->mmio_base() && addr < net->mmio_base() + kVirtioStride) {
     if (run->mmio.is_write) {
       net->write_mmio(addr, run->mmio.data, run->mmio.len);
     } else {
@@ -2571,6 +2651,51 @@ bool GetBool(napi_env env, napi_value obj, const char* name, bool fallback = fal
   return out;
 }
 
+struct AttachedDiskConfig {
+  std::string path;
+  bool read_only{false};
+};
+
+bool HasNonNullishNamed(napi_env env, napi_value obj, const char* name) {
+  if (!HasNamed(env, obj, name)) {
+    return false;
+  }
+  return !IsNullish(env, GetNamed(env, obj, name));
+}
+
+std::vector<AttachedDiskConfig> GetAttachedDisks(napi_env env, napi_value obj) {
+  bool has_disks = HasNonNullishNamed(env, obj, "disks");
+  bool has_attached_disks = HasNonNullishNamed(env, obj, "attachedDisks");
+  if (!has_disks && !has_attached_disks) {
+    return {};
+  }
+  Check(!(has_disks && has_attached_disks), "use either disks or attachedDisks, not both");
+
+  const char* name = has_disks ? "disks" : "attachedDisks";
+  napi_value value = GetNamed(env, obj, name);
+  bool is_array = false;
+  napi_is_array(env, value, &is_array);
+  Check(is_array, std::string(name) + " must be an array");
+
+  uint32_t length = 0;
+  napi_get_array_length(env, value, &length);
+  std::vector<AttachedDiskConfig> out;
+  out.reserve(length);
+  for (uint32_t i = 0; i < length; i++) {
+    napi_value entry;
+    napi_get_element(env, value, i, &entry);
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, entry, &type);
+    Check(type == napi_object, std::string(name) + " entries must be objects");
+    AttachedDiskConfig disk;
+    disk.path = GetString(env, entry, "path");
+    Check(!disk.path.empty(), std::string(name) + " entries require path");
+    disk.read_only = GetBool(env, entry, "readOnly", GetBool(env, entry, "readonly", false));
+    out.push_back(std::move(disk));
+  }
+  return out;
+}
+
 struct RunControl {
   int32_t* words{nullptr};
   size_t length{0};
@@ -2587,6 +2712,12 @@ struct RunControl {
   void set_state(int32_t state) const {
     if (enabled()) {
       __atomic_store_n(&words[1], state, __ATOMIC_SEQ_CST);
+    }
+  }
+
+  void mark_console_output() const {
+    if (words != nullptr && length >= 3) {
+      __atomic_store_n(&words[2], 1, __ATOMIC_SEQ_CST);
     }
   }
 };
@@ -2625,7 +2756,14 @@ class TerminalRawMode {
       return;
     }
     struct termios raw = old_;
-    cfmakeraw(&raw);
+    raw.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
+                     INLCR | IGNCR | ICRNL | IXON);
+    raw.c_oflag |= OPOST;
+    raw.c_lflag &= ~(ECHO | ECHONL | ICANON | IEXTEN | ISIG);
+    raw.c_cflag &= ~(CSIZE | PARENB);
+    raw.c_cflag |= CS8;
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
       active_ = true;
     }
@@ -3036,9 +3174,13 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     bool interactive = GetBool(env, argv[0], "interactive", false);
     std::string tap_name = GetString(env, argv[0], "netTapName");
     std::string guest_mac = GetString(env, argv[0], "netGuestMac");
+    std::vector<AttachedDiskConfig> attached_disks = GetAttachedDisks(env, argv[0]);
     RunControl control = GetRunControl(env, argv[0]);
     control.set_state(kControlStateStarting);
     bool network_enabled = !tap_name.empty();
+    Check(attached_disks.size() < kMaxIoApicPins, "too many attached disks");
+    uint32_t disk_count = static_cast<uint32_t>(attached_disks.size() + 1);
+    CheckVirtioMmioDeviceCount(disk_count + (network_enabled ? 1 : 0));
     Check(!kernel_path.empty(), "kernelPath is required");
     Check(!rootfs_path.empty(), "rootfsPath is required");
     Check(!cmdline.empty(), "cmdline is required");
@@ -3049,15 +3191,26 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
     KvmSystem sys = CreateVm(mem_mib, true);
     GuestMemory mem = sys.guest();
     KernelInfo kernel = LoadElfKernel(mem, kernel_path);
-    uint64_t rsdp_addr = CreateAcpiTables(mem, network_enabled, static_cast<int>(cpus));
+    uint64_t rsdp_addr = CreateAcpiTables(mem, network_enabled, static_cast<int>(cpus), disk_count);
     WriteBootParams(mem, uint64_t(mem_mib) * 1024ULL * 1024ULL, cmdline);
     WriteU64(mem.ptr(kBootParamsAddr + 0x70, 8), rsdp_addr);
     WriteMpTable(mem, static_cast<int>(cpus));
     SetIrqRouting(sys);
-	    VirtioBlk blk(sys, mem, rootfs_path, overlay_path);
+    std::vector<std::unique_ptr<VirtioBlk>> blks;
+    blks.reserve(disk_count);
+    blks.push_back(std::make_unique<VirtioBlk>(
+        sys, mem, VirtioMmioBase(0), VirtioMmioIrq(0), rootfs_path, overlay_path, false));
+    for (uint32_t i = 0; i < attached_disks.size(); i++) {
+      const AttachedDiskConfig& disk = attached_disks[i];
+      uint32_t index = i + 1;
+      blks.push_back(std::make_unique<VirtioBlk>(
+          sys, mem, VirtioMmioBase(index), VirtioMmioIrq(index), disk.path, "", disk.read_only));
+    }
     std::unique_ptr<VirtioNet> net;
     if (network_enabled) {
-      net = std::make_unique<VirtioNet>(sys, mem, tap_name, guest_mac);
+      uint32_t net_index = disk_count;
+      net = std::make_unique<VirtioNet>(
+          sys, mem, VirtioMmioBase(net_index), VirtioMmioIrq(net_index), tap_name, guest_mac);
     }
 
     std::vector<Vcpu> vcpus;
@@ -3070,7 +3223,7 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
       SetupApplicationVcpu(sys, vcpus[i], i, cpus);
     }
 
-    Uart uart(console_limit, interactive, &sys);
+    Uart uart(console_limit, interactive, &sys, [control]() { control.mark_console_output(); });
     TerminalRawMode raw_mode(interactive);
     std::atomic<bool> input_done{false};
     std::atomic<bool> host_interrupt_requested{false};
@@ -3329,7 +3482,7 @@ napi_value RunVm(napi_env env, napi_callback_info info) {
           case KVM_EXIT_MMIO:
             {
               std::lock_guard<std::mutex> lock(device_mu);
-              HandleMmio(cpu.run, blk, net.get());
+              HandleMmio(cpu.run, blks, net.get());
             }
             break;
           case KVM_EXIT_IRQ_WINDOW_OPEN:

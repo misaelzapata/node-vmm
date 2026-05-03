@@ -236,6 +236,99 @@ Measured on 2026-04-28 with guest-written dirty pages:
 The full base RAM file is sparse. The per-request path should use the dirty
 delta, not a full RAM copy.
 
+## Latest Windows WHP Local Result
+
+Measured on 2026-05-03 on the local Windows/WHP host with Node.js 24.15.0, the
+fetched default guest kernel, one vCPU, `--net none` for command runs, and
+temporary cache directories. Release prebuilt rootfs assets for `v0.1.3` were
+not available during this run, so cold `--image` paths fell back to the WSL2 OCI
+builder. Warm rows reuse the prepared rootfs cache.
+
+| Path | Image / command | Cache/build | Result |
+| --- | --- | --- | ---: |
+| Cold command | `alpine:3.20`, `tty`/`stty -F /dev/ttyS0` | miss, WSL2 OCI build | 12.280 s |
+| Warm command | `alpine:3.20`, `true` | hit | 618-621 ms |
+| Warm TTY sanity | `alpine:3.20`, `tty` + `/dev/ttyS0` check | hit | 779-819 ms |
+| Direct lifecycle | `alpine:3.20`, `sleep 30` | already running | resume 1-2 ms |
+| Plain Node HTTP | `node:22-alpine` app server | cold WSL2 OCI build | pause 8 ms, resume-to-HTTP 58 ms |
+
+The `tty` command is intentionally a batch-mode sanity check here. Batch runs
+attach stdin to `/dev/null`, so `tty` prints `not a tty`; the same command then
+checks that `/dev/ttyS0` exists and can be configured through `stty -F
+/dev/ttyS0`.
+
+Raw WHP command/lifecycle sample:
+
+```json
+{
+  "date": "2026-05-03T15:29:20.371Z",
+  "platform": "win32/x64",
+  "image": "alpine:3.20",
+  "samples": [
+    {
+      "label": "cold tty/stty",
+      "ms": 12280,
+      "exitReason": "guest-exit",
+      "runs": 1259,
+      "status": 0,
+      "output": ["not a tty", "ttyS0=yes", "TTY_OK"]
+    },
+    { "label": "warm true 1", "ms": 618, "exitReason": "guest-exit", "runs": 1119, "status": 0 },
+    { "label": "warm true 2", "ms": 618, "exitReason": "guest-exit", "runs": 1119, "status": 0 },
+    { "label": "warm true 3", "ms": 621, "exitReason": "guest-exit", "runs": 1119, "status": 0 },
+    {
+      "label": "warm tty/stty 1",
+      "ms": 815,
+      "exitReason": "guest-exit",
+      "runs": 1251,
+      "status": 0,
+      "output": ["not a tty", "ttyS0=yes", "TTY_OK"]
+    },
+    {
+      "label": "warm tty/stty 2",
+      "ms": 819,
+      "exitReason": "guest-exit",
+      "runs": 1251,
+      "status": 0,
+      "output": ["not a tty", "ttyS0=yes", "TTY_OK"]
+    },
+    {
+      "label": "warm tty/stty 3",
+      "ms": 779,
+      "exitReason": "guest-exit",
+      "runs": 1251,
+      "status": 0,
+      "output": ["not a tty", "ttyS0=yes", "TTY_OK"]
+    }
+  ],
+  "lifecycle": [
+    { "i": 1, "pauseMs": 133, "resumeMs": 2, "state": "running" },
+    { "i": 2, "pauseMs": 2, "resumeMs": 2, "state": "running" },
+    { "i": 3, "pauseMs": 11, "resumeMs": 2, "state": "running" },
+    { "i": 4, "pauseMs": 2, "resumeMs": 2, "state": "running" },
+    { "i": 5, "pauseMs": 1, "resumeMs": 1, "state": "running" }
+  ],
+  "stopMs": 28,
+  "stopExitReason": "host-stop"
+}
+```
+
+Raw WHP app smoke sample:
+
+```json
+{
+  "app": "plain-node",
+  "totalMs": 32993,
+  "bootToHttpMs": 3231,
+  "resumeToHttpMs": 58,
+  "pauseMs": 8,
+  "pausedHttpBlocked": true,
+  "stopExitReason": "host-stop",
+  "htmlMarker": "plain-node-ok",
+  "resumedMarker": "plain-node-ok"
+}
+```
+
 ## Latest Controlled Pause/Resume Result
 
 Measured on 2026-04-28 with `node:22-alpine`, a guest HTTP server on port 3000,

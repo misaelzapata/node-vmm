@@ -3,9 +3,11 @@
 `node-vmm` exposes an ESM SDK for TypeScript and JavaScript. The high-level API
 uses safe defaults and cleans temporary rootfs/cache artifacts it owns.
 
-The current npm runtime is Linux/KVM. VM execution expects `/dev/kvm`, a Linux
-guest kernel, and root privileges for rootfs mounting and network setup. In CI,
-run release/e2e commands with passwordless `sudo -n`.
+Linux/KVM and Windows/WHP are the supported x64 host backends. VM execution
+expects a Linux guest kernel. Linux/KVM uses `/dev/kvm` and needs root
+privileges for rootfs mounting and automatic TAP/NAT setup; Windows/WHP runs the
+VM as the current Windows user and only uses WSL2 when it must build a fresh
+rootfs locally from OCI layers.
 
 ## Running Without Sudo
 
@@ -35,8 +37,8 @@ const result = await kvm.runCode({
 console.log(result.guestOutput);
 ```
 
-Root is still required when the SDK builds/mounts rootfs images or creates
-automatic TAP/NAT networking.
+Root is still required on Linux when the SDK builds/mounts rootfs images or
+creates automatic TAP/NAT networking. Windows/WHP does not use Linux `sudo`.
 
 ## Simple API
 
@@ -84,11 +86,13 @@ const kvm = createNodeVmmClient({
 
 `cacheDir` stores downloaded OCI blobs and prepared ext4 rootfs images. Repeated
 `runImage({ image: ... })` calls reuse the prepared rootfs when the image,
-disk size, platform, build args, env, workdir, and init mode match. Commands are
-injected at boot, so different `cmd` values can reuse the same cached image.
+disk size, platform architecture, build args, env, entrypoint, workdir, and
+Dockerfile RUN timeout match. Commands are injected at boot, so different `cmd`
+values can reuse the same cached image.
 Cached rootfs runs automatically use a temporary overlay so guest writes do not
 change the cached base disk. Custom `entrypoint` overrides currently use a
-one-off rootfs.
+one-off rootfs. On Windows, supported images can also populate this cache from a
+prebuilt GitHub Release rootfs before falling back to the WSL2 OCI builder.
 
 ### Kernel Helpers
 
@@ -107,6 +111,41 @@ import { fetchGocrackerKernel } from "@misaelzapata/node-vmm/kernel";
 
 const kernel = await fetchGocrackerKernel();
 process.env.NODE_VMM_KERNEL = kernel.path;
+```
+
+### Windows Prebuilt Rootfs
+
+On Windows, `run()` and `runCode()` use the same cache/prebuilt/fallback path as
+the CLI. For `alpine:3.20`, `node:20-alpine`, `node:22-alpine`, and
+`oven/bun:1-alpine`, a cold cache tries to download the package-versioned
+release asset first:
+
+```ts
+import kvm from "@misaelzapata/node-vmm";
+
+const result = await kvm.run({
+  image: "alpine:3.20",
+  cmd: "uname -a",
+  memory: 256,
+  net: "none",
+});
+
+console.log(result.guestOutput);
+```
+
+If the prebuilt asset is available and the checksum verifies, no WSL2 process is
+spawned. If the image is unsupported, the asset is missing, or the fetch fails,
+the SDK falls back to the WSL2 OCI rootfs builder when WSL2 is installed.
+
+To guarantee the no-WSL path, pass an existing ext4 disk:
+
+```ts
+await kvm.run({
+  rootfsPath: "C:\\vms\\alpine.ext4",
+  cmd: "echo no-wsl",
+  memory: 256,
+  net: "none",
+});
 ```
 
 ### `kvm.build(options)`
@@ -218,6 +257,156 @@ console.log(result.restored); // true
 
 Use `overlayPath` plus `keepOverlay: true` only when debugging the native disk
 layer; normal sandbox runs create and delete their own overlay.
+
+### Disk Persistence, Reset, And Size
+
+The stable SDK exposes one root disk, optional persistent root-disk
+materialization, optional copy-on-write overlays, and attached data disks.
+
+Persistent rootfs writes:
+
+```ts
+await kvm.run({
+  rootfsPath: "./stateful.ext4",
+  cmd: "echo persisted > /var/lib/node-vmm-marker",
+  sandbox: false,
+  net: "none",
+});
+```
+
+Named persistent root disk under `cacheDir/disks`:
+
+```ts
+await kvm.run({
+  image: "node:22-alpine",
+  persist: "node-work",
+  diskSizeMiB: 2048,
+  cmd: "npm --version > /root/npm-version.txt",
+  net: "none",
+});
+```
+
+With `persist: "node-work"`, the SDK creates or reuses
+`cacheDir/disks/node-work.ext4` and keeps `cacheDir/disks/node-work.json`
+metadata next to it. The metadata records the source image/rootfs and relevant
+build options. Reusing the same name with a different source fails until you
+pass `reset: true`, which prevents old state from being attached to the wrong
+guest.
+
+Explicit persistent root disk path:
+
+```ts
+await kvm.run({
+  image: "alpine:3.20",
+  diskPath: "./work.ext4",
+  diskSizeMiB: 1024,
+  cmd: "echo persisted > /root/marker",
+  net: "none",
+});
+```
+
+`diskPath` is useful when your application wants to own the disk file location
+instead of letting node-vmm store it under `cacheDir/disks`. It behaves like
+`persist`: node-vmm creates the disk from the selected source on first use,
+boots it as writable `/dev/vda`, and reuses it on later runs. It cannot be
+combined with `persist` or `rootfsPath`.
+
+Reset-on-exit writes:
+
+```ts
+await kvm.run({
+  rootfsPath: "./stateful.ext4",
+  cmd: "echo temporary > /var/lib/node-vmm-marker",
+  sandbox: true,
+  net: "none",
+});
+```
+
+Cached and prebuilt `image` runs also use an overlay automatically so the shared
+base rootfs is not mutated unless you opt into `persist` or `diskPath`. Use
+`disk`, `diskMiB`, or `diskSizeMiB` when building, first caching an image, or
+materializing a persistent root disk:
+
+```ts
+await kvm.build({
+  image: "node:22-alpine",
+  output: "./node22.ext4",
+  diskMiB: 1024,
+});
+```
+
+Existing persistent root disks can grow but cannot shrink. When a persistent
+root disk grows and the guest has `resize2fs`, node-vmm asks the guest to resize
+`/dev/vda` on boot. `reset: true` recreates a `persist` or `diskPath` root disk
+from the current source; it is separate from `sandbox: true`, which resets by
+discarding an overlay after the VM exits.
+
+The write path is:
+
+- `rootfsPath` without `sandbox`, `persist`, and `diskPath` write directly to
+  the root disk backing file.
+- `image` without `persist` or `diskPath` writes to a temporary sparse overlay,
+  protecting the cached/prebuilt base rootfs.
+- `sandbox: true` or `restore: true` always uses a reset-on-exit overlay.
+- `reset: true` only recreates stateful root disks from `persist` or `diskPath`;
+  it does not mean "discard this run's overlay".
+
+The resize path is:
+
+- The host file is extended first when the requested size is larger.
+- Shrinking fails.
+- A grown root disk boots with `node_vmm.resize_rootfs=1`; the guest init script
+  runs `resize2fs /dev/vda` when available.
+- Attached disks are not resized by node-vmm.
+
+### Attach Disks
+
+Secondary data disks are available through `attachDisks`. Each disk must already
+exist as a host file. node-vmm does not create, format, partition, or mount data
+disks for the guest; it only maps them as virtio block devices after the root
+disk. The root disk is `/dev/vda`, so attached disks start at `/dev/vdb`.
+Read-write attached disks write directly to their host file. Read-only attached
+disks reject guest writes with a block I/O error.
+
+```ts
+const result = await kvm.run({
+  rootfsPath: "./alpine.ext4",
+  attachDisks: [
+    { path: "./data.ext4" },
+    { path: "./reference.ext4", readonly: true },
+  ],
+  cmd: "lsblk && test -b /dev/vdb && test -b /dev/vdc",
+  net: "none",
+});
+
+console.log(result.attachedDisks);
+```
+
+Up to 16 data disks can be attached. `result.attachedDisks` and live VM handles
+report the resolved host path, read-only flag, and guest device name.
+
+CLI/SDK parity for the current disk surface is:
+
+| Concept | CLI | SDK |
+| --- | --- | --- |
+| Existing rootfs | `--rootfs ./disk.ext4` | `rootfsPath: "./disk.ext4"` |
+| Named persistent root disk | `--persist work` | `persist: "work"` |
+| Explicit persistent root disk | `--disk-path ./work.ext4` | `diskPath: "./work.ext4"` |
+| Recreate persistent root disk | `--reset` | `reset: true` |
+| Build/cold-cache/grow size | `--disk-size 1024` or legacy `--disk 1024` | `disk: 1024`, `diskMiB: 1024`, or `diskSizeMiB: 1024` |
+| Reset overlay | `--sandbox` / `--restore` | `sandbox: true` / `restore: true` |
+| Explicit overlay | `--overlay ./run.overlay` | `overlayPath: "./run.overlay"` |
+| Keep overlay | `--keep-overlay` | `keepOverlay: true` |
+| Attached data disks | `--attach-disk ./data.ext4` | `attachDisks: [{ path: "./data.ext4" }]` |
+| Read-only data disks | `--attach-disk-ro ./seed.ext4` | `attachDisks: [{ path: "./seed.ext4", readonly: true }]` |
+
+CLI examples that match the SDK snippets above:
+
+```bash
+node-vmm run --image node:22-alpine --persist node-work --disk-size 2048 --cmd "npm --version"
+node-vmm run --image alpine:3.20 --disk-path ./work.ext4 --disk-size 1024 --cmd "echo persisted"
+node-vmm run --rootfs ./alpine.ext4 --attach-disk ./data.ext4 --attach-disk-ro ./reference.ext4 --cmd "lsblk"
+```
 
 For the lowest-latency JS workflow today, build once and run many:
 

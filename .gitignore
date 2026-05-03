@@ -13,3 +13,5 @@ node-vmm-*.tgz
 .node-vmm/
 .node-vmm-demo/
 .codex
+.tools/
+.npm-cache/

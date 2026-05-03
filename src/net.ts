@@ -1,7 +1,8 @@
+import { existsSync } from "node:fs";
 import net from "node:net";
 
 import { requireCommands, runCommand } from "./process.js";
-import type { NetworkConfig, PortForward, PortForwardInput } from "./types.js";
+import type { NetworkConfig, PortForward, PortForwardInput, SlirpHostFwd } from "./types.js";
 import { NodeVmmError, compactIdForTap, deterministicMac, requireRoot } from "./utils.js";
 
 export interface SetupNetworkOptions {
@@ -17,6 +18,28 @@ function randomSubnetOctet(id: string): number {
     sum = (sum + char.charCodeAt(0)) % 140;
   }
   return 80 + sum;
+}
+
+function socketVmnetPath(): string | undefined {
+  const configured = process.env.NODE_VMM_SOCKET_VMNET;
+  if (configured) {
+    return configured;
+  }
+  const candidates = [
+    "/opt/socket_vmnet/socket_vmnet",
+    "/var/run/socket_vmnet",
+    "/opt/homebrew/var/run/socket_vmnet",
+    "/usr/local/var/run/socket_vmnet",
+  ];
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+function macNetworkBackend(): "slirp" | "socket_vmnet" | "vmnet" {
+  const backend = (process.env.NODE_VMM_HVF_NET_BACKEND || process.env.NODE_VMM_MAC_NET || "slirp").trim();
+  if (backend === "socket_vmnet" || backend === "vmnet" || backend === "slirp") {
+    return backend;
+  }
+  throw new NodeVmmError(`unsupported macOS HVF network backend: ${backend}`);
 }
 
 function validatePort(port: number, label: string, options: { allowZero?: boolean } = {}): number {
@@ -114,6 +137,18 @@ async function closeServer(server: net.Server): Promise<void> {
   });
 }
 
+async function resolveHostPort(host: string, port: number): Promise<number> {
+  if (port !== 0) {
+    return port;
+  }
+  const server = net.createServer();
+  try {
+    return await listen(server, host, 0);
+  } finally {
+    await closeServer(server);
+  }
+}
+
 async function setupPortForwards(
   inputs: PortForwardInput[] | undefined,
   guestIp: string,
@@ -169,10 +204,38 @@ async function setupPortForwards(
   };
 }
 
+async function allocatePortForwards(inputs: PortForwardInput[] | undefined): Promise<PortForward[]> {
+  const requested = (inputs ?? []).map(parsePortForward);
+  const active: PortForward[] = [];
+  for (const mapping of requested) {
+    const host = mapping.host || "127.0.0.1";
+    if (mapping.hostPort !== 0) {
+      active.push({ host, hostPort: mapping.hostPort, guestPort: mapping.guestPort });
+      continue;
+    }
+    const server = net.createServer();
+    try {
+      const hostPort = await listen(server, host, 0);
+      active.push({ host, hostPort, guestPort: mapping.guestPort });
+    } finally {
+      await closeServer(server);
+    }
+  }
+  return active;
+}
+
 export async function setupNetwork(options: SetupNetworkOptions): Promise<NetworkConfig> {
-  const mode = options.mode || (options.tapName ? "tap" : "none");
+  let mode = options.mode || (options.tapName ? "tap" : "none");
+  // On Windows/WHP and macOS/HVF, "auto" resolves to libslirp user-mode
+  // networking. On Linux/KVM, "auto" stays as the TAP+NAT path further below.
+  if (mode === "auto" && process.platform === "win32") {
+    mode = "slirp";
+  }
+  if (mode === "auto" && process.platform === "darwin" && macNetworkBackend() === "slirp") {
+    mode = "slirp";
+  }
   if (mode === "none" && (options.ports?.length ?? 0) > 0) {
-    throw new NodeVmmError("--publish requires --net auto");
+    throw new NodeVmmError("--publish requires --net auto or --net slirp");
   }
   if (mode === "none") {
     return { mode: "none" };
@@ -180,10 +243,13 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
 
   if (mode === "tap") {
     if ((options.ports?.length ?? 0) > 0) {
-      throw new NodeVmmError("--publish requires --net auto");
+      throw new NodeVmmError("--publish requires --net auto or --net slirp");
     }
     if (!options.tapName) {
       throw new NodeVmmError("--net tap requires --tap NAME");
+    }
+    if (process.platform === "darwin") {
+      throw new NodeVmmError("macOS/HVF does not support arbitrary --net tap devices; use --net auto for slirp networking");
     }
     return {
       mode: "tap",
@@ -193,19 +259,82 @@ export async function setupNetwork(options: SetupNetworkOptions): Promise<Networ
     };
   }
 
+  if (mode === "slirp") {
+    // libslirp uses a fixed 10.0.2.0/24 layout; the guest gets 10.0.2.15,
+    // host is reachable at 10.0.2.2, DNS at 10.0.2.3. Port forwarding goes
+    // through libslirp's hostfwd, so the host-side TCP proxy used for `auto`
+    // mode is not required.
+    const hostFwds: SlirpHostFwd[] = [];
+    for (const p of (options.ports ?? []).map(parsePortForward)) {
+      const hostAddr = p.host || "127.0.0.1";
+      hostFwds.push({
+        udp: false,
+        hostAddr,
+        hostPort: await resolveHostPort(hostAddr, p.hostPort),
+        guestPort: p.guestPort,
+      });
+    }
+    return {
+      mode: "slirp",
+      ifaceId: "eth0",
+      tapName: process.platform === "darwin" ? "slirp" : undefined,
+      guestMac: deterministicMac(options.id),
+      guestIp: "10.0.2.15",
+      hostIp: "10.0.2.2",
+      netmask: "255.255.255.0",
+      cidrPrefix: 24,
+      dns: "10.0.2.3",
+      cidr: "10.0.2.15/24",
+      // Skip the kernel-side ip= autoconf because it forces the kernel to
+      // wait for the eth0 carrier; the userspace init script in src/rootfs.ts
+      // brings up the interface itself once it sees node_vmm.iface=...
+      kernelNetArgs:
+        "node_vmm.iface=eth0 node_vmm.ip=10.0.2.15/24 node_vmm.gw=10.0.2.2 node_vmm.dns=10.0.2.3",
+      ports: hostFwds.map((h) => ({
+        host: h.hostAddr,
+        hostPort: h.hostPort,
+        guestPort: h.guestPort,
+      })),
+      hostFwds,
+      cleanup: async () => {},
+    };
+  }
+
   if (mode !== "auto") {
     throw new NodeVmmError(`unsupported network mode: ${mode}`);
   }
 
-  // macOS: use vmnet.framework (no ip/iptables needed; HVF backend handles it)
+  // macOS: prefer QEMU-style user networking through libslirp. vmnet/socket_vmnet
+  // remain available through NODE_VMM_HVF_NET_BACKEND for privileged setups.
   if (process.platform === "darwin") {
+    const backend = macNetworkBackend();
+    const vmnetSocket = backend === "socket_vmnet" ? socketVmnetPath() : undefined;
+    if (backend === "socket_vmnet" && !vmnetSocket) {
+      throw new NodeVmmError("NODE_VMM_HVF_NET_BACKEND=socket_vmnet requires NODE_VMM_SOCKET_VMNET or a socket_vmnet socket");
+    }
+    const slirp = backend === "slirp";
+    const octet = randomSubnetOctet(options.id);
+    const hostIp = slirp ? "10.0.2.2" : `172.31.${octet}.1`;
+    const guestIp = slirp ? "10.0.2.15" : `172.31.${octet}.2`;
+    const netmask = slirp ? "255.255.255.0" : "255.255.255.252";
+    const cidrPrefix = slirp ? 24 : 30;
+    const dns = process.env.NODE_VMM_GUEST_DNS || (slirp ? "10.0.2.3" : "1.1.1.1");
+    const portForwards = slirp ? undefined : await setupPortForwards(options.ports, guestIp);
+    const ports = slirp ? await allocatePortForwards(options.ports) : portForwards?.ports;
     return {
-      mode: "tap",
-      tapName: "vmnet:shared",
+      mode: slirp ? "slirp" : "tap",
+      ifaceId: "eth0",
+      tapName: slirp ? "slirp" : (vmnetSocket ? `socket_vmnet:${vmnetSocket}` : "vmnet:shared"),
       guestMac: deterministicMac(options.id),
-      // kernelNetArgs tells the guest kernel to use DHCP (vmnet provides DHCP)
-      kernelNetArgs: "ip=dhcp",
-      cleanup: async () => { /* vmnet lifecycle managed in native backend */ },
+      hostIp,
+      guestIp,
+      netmask,
+      cidrPrefix,
+      dns,
+      kernelIpArg: `ip=${guestIp}::${hostIp}:${netmask}:node-vmm:eth0:off`,
+      kernelNetArgs: `node_vmm.iface=eth0 node_vmm.ip=${guestIp}/${cidrPrefix} node_vmm.gw=${hostIp} node_vmm.dns=${dns}`,
+      ports,
+      cleanup: portForwards?.cleanup ?? (async () => undefined),
     };
   }
 

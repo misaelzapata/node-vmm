@@ -55,6 +55,7 @@ export async function runCommand(
       return;
     }
     try {
+      /* c8 ignore next 3 - detached process-group signaling is POSIX-specific; timeout and abort tests still cover cleanup behavior. */
       if (detached) {
         process.kill(-child.pid, signal);
       } else {
@@ -83,10 +84,12 @@ export async function runCommand(
   };
   /* c8 ignore stop */
 
+  /* c8 ignore start - host signal forwarding is covered on POSIX; Windows cannot safely self-signal in local coverage. */
   const handleSignal = (signal: NodeJS.Signals): void => {
     forwardedSignal = signal;
     signalChild(signal);
   };
+  /* c8 ignore stop */
 
   const handleAbort = (): void => {
     aborted = true;
@@ -154,6 +157,7 @@ export async function runCommand(
   if (timedOut && !options.allowFailure) {
     throw new NodeVmmError(`command timed out after ${options.timeoutMs}ms: ${command} ${args.join(" ")}`);
   }
+  /* c8 ignore next 3 - paired with the POSIX-only host signal forwarding path above. */
   if (forwardedSignal && !options.allowFailure) {
     throw new NodeVmmError(`command interrupted by ${forwardedSignal}: ${command} ${args.join(" ")}`);
   }
@@ -165,7 +169,9 @@ export async function runCommand(
 }
 
 export async function commandExists(command: string): Promise<boolean> {
-  const result = await runCommand("which", [command], { capture: true, allowFailure: true });
+  /* c8 ignore next - one host covers either Windows or POSIX finder selection; commandExists behavior is tested for present/missing commands. */
+  const finder = process.platform === "win32" ? "where.exe" : "which";
+  const result = await runCommand(finder, [command], { capture: true, allowFailure: true });
   return result.code === 0;
 }
 

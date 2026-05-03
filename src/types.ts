@@ -1,6 +1,30 @@
 export type StringMap = Record<string, string>;
 
-export type NetworkMode = "auto" | "none" | "tap";
+export type NetworkMode = "auto" | "none" | "tap" | "slirp";
+
+export type HostBackend = "kvm" | "whp" | "hvf" | "unsupported";
+
+export interface HostPlatformInfo {
+  platform: string;
+  arch: string;
+}
+
+export interface HostCapabilities {
+  backend: HostBackend;
+  platform: string;
+  arch: string;
+  archLine: string;
+  vmRuntime: boolean;
+  rootfsBuild: boolean;
+  prebuiltRootfs: boolean;
+  defaultNetwork: NetworkMode;
+  networkModes: NetworkMode[];
+  tapNetwork: boolean;
+  portForwarding: boolean;
+  minCpus: number;
+  maxCpus: number;
+  rootfsMaxCpus: number;
+}
 
 export interface PortForward {
   host?: string;
@@ -9,6 +33,19 @@ export interface PortForward {
 }
 
 export type PortForwardInput = string | number | PortForward;
+
+export type PrebuiltRootfsMode = "auto" | "off" | "require";
+
+export interface AttachedDisk {
+  path: string;
+  readonly?: boolean;
+}
+
+export interface ResolvedAttachedDisk {
+  path: string;
+  readonly: boolean;
+  device: string;
+}
 
 export interface ImageConfig {
   env: string[];
@@ -40,19 +77,33 @@ export interface RootfsBuildOptions {
 }
 
 export interface NetworkConfig {
-  mode: "none" | "tap";
+  mode: "none" | "tap" | "slirp";
   ifaceId?: string;
   tapName?: string;
   guestMac?: string;
   hostIp?: string;
   guestIp?: string;
   netmask?: string;
+  cidr?: string;
   cidrPrefix?: number;
   dns?: string;
   kernelIpArg?: string;
   kernelNetArgs?: string;
   ports?: PortForward[];
+  hostFwds?: SlirpHostFwd[];
   cleanup?: () => Promise<void>;
+}
+
+export interface SlirpHostFwd {
+  udp: boolean;
+  hostAddr: string;
+  hostPort: number;
+  guestPort: number;
+}
+
+export interface NodeVmmProgressEvent {
+  type: "guest-console-ready";
+  id: string;
 }
 
 export interface NodeVmmClientOptions {
@@ -60,6 +111,7 @@ export interface NodeVmmClientOptions {
   cacheDir?: string;
   tempDir?: string;
   logger?: (message: string) => void;
+  progress?: (event: NodeVmmProgressEvent) => void;
 }
 
 export interface SdkBuildOptions {
@@ -72,6 +124,7 @@ export interface SdkBuildOptions {
   output: string;
   disk?: number;
   diskMiB?: number;
+  diskSizeMiB?: number;
   buildArgs?: StringMap;
   env?: StringMap;
   cmd?: string;
@@ -111,6 +164,7 @@ export interface SdkVmOptions {
   overlayPath?: string;
   overlayDir?: string;
   keepOverlay?: boolean;
+  attachDisks?: AttachedDisk[];
   snapshotOut?: string;
   signal?: AbortSignal;
 }
@@ -129,8 +183,13 @@ export interface SdkRunOptions extends SdkVmOptions {
   subdir?: string;
   contextDir?: string;
   rootfsPath?: string;
+  diskPath?: string;
   disk?: number;
   diskMiB?: number;
+  diskSizeMiB?: number;
+  prebuilt?: PrebuiltRootfsMode;
+  persist?: string;
+  reset?: boolean;
   buildArgs?: StringMap;
   env?: StringMap;
   cmd?: string;
@@ -161,6 +220,8 @@ export interface SdkPrepareOptions extends SdkVmOptions {
   rootfsPath?: string;
   disk?: number;
   diskMiB?: number;
+  diskSizeMiB?: number;
+  prebuilt?: PrebuiltRootfsMode;
   buildArgs?: StringMap;
   env?: StringMap;
   cmd?: string;
@@ -190,6 +251,7 @@ export interface SdkRunResult {
   id: string;
   rootfsPath: string;
   overlayPath?: string;
+  attachedDisks: ResolvedAttachedDisk[];
   restored: boolean;
   builtRootfs: boolean;
   network: NetworkConfig;
@@ -208,6 +270,7 @@ export interface RunningVm {
   id: string;
   rootfsPath: string;
   overlayPath?: string;
+  attachedDisks: ResolvedAttachedDisk[];
   restored: boolean;
   builtRootfs: boolean;
   network: NetworkConfig;

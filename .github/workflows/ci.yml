@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    name: linux build, unit, pack
+  hosted-linux:
+    name: hosted Linux build, unit, pack
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -24,8 +24,8 @@ jobs:
       - run: npm run test:unit
       - run: npm run pack:check
 
-  windows:
-    name: windows build, import, pack
+  hosted-windows-js:
+    name: hosted Windows JS-only build, import, pack
     runs-on: windows-latest
     env:
       NODE_VMM_SKIP_NATIVE: "1"
@@ -36,14 +36,14 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run build
+      - run: npm run build:ts
       - shell: pwsh
         run: |
           node -e "import('./dist/src/index.js').then((m)=>{ console.log(m.features()[0]); })"
       - run: npm pack --dry-run --ignore-scripts
 
-  windows-whp-gate:
-    name: windows WHP native gate
+  self-hosted-windows-whp:
+    name: self-hosted Windows WHP native gate
     runs-on: [self-hosted, windows, x64, whp]
     if: github.event_name == 'workflow_dispatch'
     steps:
@@ -54,13 +54,45 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - shell: pwsh
+      - name: Check required WHP doctor probes
+        shell: pwsh
         run: |
-          node -e "import('./dist/src/index.js').then(async (m)=>{ const doctor = await m.doctor(); console.log(JSON.stringify(doctor, null, 2)); if (!doctor.ok) process.exit(1); })"
-          node -e "import('./dist/src/kvm.js').then((m)=>{ const smoke = m.whpSmokeHlt(); console.log(JSON.stringify(smoke, null, 2)); if (smoke.exitReason !== 'hlt' || smoke.dirtyPages < 1) process.exit(1); })"
+          @'
+          import { doctor } from "./dist/src/index.js";
 
-  kvm-release-gate:
-    name: kvm release gate
+          const result = await doctor();
+          console.log(JSON.stringify(result, null, 2));
+
+          const checks = new Map(result.checks.map((check) => [check.name, check]));
+          const required = ["whp-api", "whp-dirty-pages"];
+          const failed = required
+            .map((name) => checks.get(name) ?? { name, ok: false, label: "missing required doctor check" })
+            .filter((check) => !check.ok);
+
+          if (failed.length > 0) {
+            const details = failed.map((check) => `${check.name}: ${check.label}`).join("; ");
+            console.error(`Required WHP doctor checks failed: ${details}`);
+            process.exit(1);
+          }
+          '@ | node --input-type=module -
+      - name: Run WHP dirty-page smoke
+        shell: pwsh
+        run: |
+          @'
+          import { whpSmokeHlt } from "./dist/src/kvm.js";
+
+          const smoke = whpSmokeHlt();
+          console.log(JSON.stringify(smoke, null, 2));
+
+          if (smoke.exitReason !== "hlt" || smoke.dirtyPages < 1 || smoke.dirtyTracking !== true) {
+            console.error("Required WHP dirty-page smoke failed");
+            process.exit(1);
+          }
+          '@ | node --input-type=module -
+      - run: node --test dist/test/native.test.js
+
+  self-hosted-linux-kvm:
+    name: self-hosted Linux KVM release gate
     runs-on: [self-hosted, linux, x64, kvm]
     if: github.event_name == 'workflow_dispatch'
     steps:
@@ -70,5 +102,7 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node --test dist/test/native.test.js
       - run: echo "NODE_VMM_KERNEL=$(npm run -s kernel:fetch)" >> "$GITHUB_ENV"
       - run: npm run release:check

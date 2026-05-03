@@ -33,6 +33,10 @@
       "types": "./dist/src/args.d.ts",
       "import": "./dist/src/args.js"
     },
+    "./disk": {
+      "types": "./dist/src/disk.d.ts",
+      "import": "./dist/src/disk.js"
+    },
     "./kvm": {
       "types": "./dist/src/kvm.d.ts",
       "import": "./dist/src/kvm.js"
@@ -52,6 +56,10 @@
     "./oci": {
       "types": "./dist/src/oci.d.ts",
       "import": "./dist/src/oci.js"
+    },
+    "./prebuilt-rootfs": {
+      "types": "./dist/src/prebuilt-rootfs.d.ts",
+      "import": "./dist/src/prebuilt-rootfs.js"
     },
     "./process": {
       "types": "./dist/src/process.d.ts",
@@ -82,6 +90,7 @@
     "docs",
     "scripts/build-native.mjs",
     "scripts/package-prebuild.mjs",
+    "scripts/slirp-flags.mjs",
     "binding.gyp",
     "README.md",
     "LICENSE"
@@ -97,12 +106,14 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:unit": "npm run build && node --test dist/test/unit.test.js",
     "test:coverage": "npm run test:coverage:ts && npm run test:coverage:cpp",
-    "test:coverage:ts": "npm run build && c8 --100 --all --include 'dist/src/args.js' --include 'dist/src/kernel.js' --include 'dist/src/kvm.js' --include 'dist/src/process.js' --include 'dist/src/types.js' --include 'dist/src/utils.js' --reporter=text --reporter=json-summary node --test dist/test/*.test.js",
+    "test:coverage:ts": "npm run build && c8 --100 --all --include dist/src/args.js --include dist/src/kernel.js --include dist/src/kvm.js --include dist/src/process.js --include dist/src/types.js --include dist/src/utils.js --reporter=text --reporter=json-summary node --test dist/test/*.test.js",
     "test:coverage:cpp": "npm run build:native:coverage && node --test dist/test/native.test.js && node scripts/check-gcov.mjs",
     "test:e2e": "npm run build && NODE_VMM_E2E=1 node --test dist/test/e2e.test.js",
     "test:consumers": "npm run build && node scripts/consumer-smoke.mjs",
     "test:js-apps": "npm run build && node scripts/js-app-smoke.mjs",
     "test:real-apps": "node scripts/real-app-smoke.mjs",
+    "test:whp-apps": "npm run build && node scripts/whp-app-smoke.mjs",
+    "test:macos-hvf": "npm run build && node scripts/test-macos-hvf.mjs",
     "bench:boot-run": "npm run build && node bench/boot-run.mjs",
     "bench:restore": "npm run build && node bench/restore.mjs",
     "bench:hot-sandbox": "npm run build && node bench/hot-sandbox.mjs",

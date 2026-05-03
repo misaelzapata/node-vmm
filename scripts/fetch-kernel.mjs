@@ -5,9 +5,14 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { gunzipSync } from "node:zlib";
 
-const name = process.env.NODE_VMM_KERNEL_NAME || process.argv[2] || "gocracker-guest-standard-vmlinux";
+const defaultName = process.platform === "darwin"
+  ? "gocracker-guest-standard-arm64-Image"
+  : "gocracker-guest-standard-vmlinux";
+const name = process.env.NODE_VMM_KERNEL_NAME || process.argv[2] || defaultName;
 const defaultSha256 = new Map([
   ["gocracker-guest-standard-vmlinux", "d211c41e571a2f262796cd1631e1c69e6e5ca6345248a6c628a9868f05371ff3"],
+  ["gocracker-guest-standard-arm64-Image", "88fd13179b8d86afb817cfc41a305ad6d42642a2e27bb461da3a81024aaf715b"],
+  ["gocracker-guest-minimal-arm64-Image", "9bdcf296dcaf7742e3cfdc44e9e7dd52b4af4ebd920be5bf49074772e00537f0"],
 ]);
 const baseUrl =
   process.env.NODE_VMM_KERNEL_REPO ||

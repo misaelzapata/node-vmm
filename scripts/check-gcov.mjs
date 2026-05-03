@@ -3,8 +3,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 const root = process.cwd();
-const source = "native/kvm_backend.cc";
-const objectDir = "build/Release/obj.target/node_vmm_native/native";
+const source = "native/kvm/backend.cc";
+const objectDir = "build/Release/obj.target/node_vmm_native/native/kvm";
 const exclusionsPath = path.join(root, "docs", "cpp-coverage-exclusions.json");
 
 function runGcov() {
@@ -25,7 +25,7 @@ function isExcluded(line) {
 }
 
 runGcov();
-const gcov = await readFile(path.join(root, "kvm_backend.cc.gcov"), "utf8");
+const gcov = await readFile(path.join(root, "backend.cc.gcov"), "utf8");
 const uncovered = [];
 for (const rawLine of gcov.split("\n")) {
   const parsed = parseLine(rawLine);
