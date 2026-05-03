@@ -61,6 +61,7 @@ function ensureDir(dir) {
 }
 
 function findVsTool(name) {
+  const vswherePath = "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe";
   const roots = [
     process.env.VCToolsInstallDir ? path.dirname(process.env.VCToolsInstallDir.replace(/[\\/]+$/, "")) : "",
   ];
@@ -70,19 +71,21 @@ function findVsTool(name) {
     if (existsSync(line)) return line;
   }
 
-  const vswherePath = "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe";
   if (existsSync(vswherePath)) {
+    for (const pattern of [`VC/Tools/MSVC/**/bin/Hostx64/x64/${name}`, `**/${name}`]) {
+      const foundTool = spawnSync(
+        vswherePath,
+        ["-latest", "-products", "*", "-find", pattern],
+        { encoding: "utf8" },
+      );
+      for (const line of (foundTool.stdout || "").split(/\r?\n/).filter(Boolean)) {
+        if (existsSync(line)) return line;
+      }
+    }
+
     const found = spawnSync(
       vswherePath,
-      [
-        "-latest",
-        "-products",
-        "*",
-        "-requires",
-        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-        "-property",
-        "installationPath",
-      ],
+      ["-latest", "-products", "*", "-property", "installationPath"],
       { encoding: "utf8" },
     );
     for (const line of (found.stdout || "").split(/\r?\n/).filter(Boolean)) {
