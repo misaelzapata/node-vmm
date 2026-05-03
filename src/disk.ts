@@ -115,6 +115,64 @@ async function readPersistentMetadata(metaPath: string): Promise<PersistentDiskM
   return null;
 }
 
+async function writePersistentMetadataAtomic(metaPath: string, metadata: PersistentDiskMetadata): Promise<void> {
+  const tmp = `${metaPath}.tmp-${process.pid}-${randomId("meta")}`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, metaPath);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function installPersistentDiskPair(options: {
+  diskPath: string;
+  metaPath: string;
+  tmpDiskPath: string;
+  metadata: PersistentDiskMetadata;
+}): Promise<void> {
+  const dir = path.dirname(options.diskPath);
+  const id = `${process.pid}-${randomId("replace")}`;
+  const tmpMetaPath = path.join(dir, `${path.basename(options.metaPath)}.tmp-${id}`);
+  const backupDiskPath = path.join(dir, `${path.basename(options.diskPath)}.bak-${id}`);
+  const backupMetaPath = path.join(dir, `${path.basename(options.metaPath)}.bak-${id}`);
+  let backedDisk = false;
+  let backedMeta = false;
+  let targetsCleared = false;
+
+  try {
+    await writeFile(tmpMetaPath, `${JSON.stringify(options.metadata, null, 2)}\n`, { mode: 0o600 });
+    if (await pathExists(options.diskPath)) {
+      await rename(options.diskPath, backupDiskPath);
+      backedDisk = true;
+    }
+    if (await pathExists(options.metaPath)) {
+      await rename(options.metaPath, backupMetaPath);
+      backedMeta = true;
+    }
+    targetsCleared = true;
+    await rename(options.tmpDiskPath, options.diskPath);
+    await rename(tmpMetaPath, options.metaPath);
+    await rm(backupDiskPath, { force: true }).catch(() => {});
+    await rm(backupMetaPath, { force: true }).catch(() => {});
+  } catch (error) {
+    await rm(options.tmpDiskPath, { force: true }).catch(() => {});
+    await rm(tmpMetaPath, { force: true }).catch(() => {});
+    if (targetsCleared) {
+      await rm(options.diskPath, { force: true }).catch(() => {});
+      await rm(options.metaPath, { force: true }).catch(() => {});
+    }
+    if (backedDisk) {
+      await rename(backupDiskPath, options.diskPath).catch(() => {});
+    }
+    if (backedMeta) {
+      await rename(backupMetaPath, options.metaPath).catch(() => {});
+    }
+    throw error;
+  }
+}
+
 export async function materializePersistentDisk(options: MaterializePersistentDiskOptions): Promise<MaterializedDisk> {
   validatePersistentName(options.name);
   const diskDir = path.join(options.cacheDir, "disks");
@@ -148,9 +206,7 @@ export async function materializePersistentDisk(options: MaterializePersistentDi
         createdAt: meta?.createdAt ?? now,
         updatedAt: now,
       };
-      await rm(diskPath, { force: true });
-      await rename(tmp, diskPath);
-      await writeFile(metaPath, `${JSON.stringify(nextMeta, null, 2)}\n`, { mode: 0o600 });
+      await installPersistentDiskPair({ diskPath, metaPath, tmpDiskPath: tmp, metadata: nextMeta });
       options.logger?.(`node-vmm persistent disk ready: ${diskPath}`);
       created = true;
     } catch (error) {
@@ -173,7 +229,7 @@ export async function materializePersistentDisk(options: MaterializePersistentDi
       sizeMiB: options.diskMiB,
       updatedAt: now,
     };
-    await writeFile(metaPath, `${JSON.stringify(nextMeta, null, 2)}\n`, { mode: 0o600 });
+    await writePersistentMetadataAtomic(metaPath, nextMeta);
   }
 
   return { rootfsPath: diskPath, resized, created };

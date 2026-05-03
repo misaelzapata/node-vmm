@@ -33,6 +33,7 @@ import nodeVmmDefault, {
   features,
   gocrackerKernelUrl,
   hostBackendForHost,
+  materializePersistentDisk,
   nodeVmm,
   parseOptions,
   prepare,
@@ -1396,6 +1397,45 @@ test("CLI accepts root disk persistence flag shapes and validates contradictory 
       ]),
     /--disk must be at least 1 MiB/,
   );
+});
+
+test("materializePersistentDisk creates a disk and metadata pair", async () => {
+  const cacheDir = await mkdtemp(path.join(os.tmpdir(), "node-vmm-persist-test-"));
+  try {
+    const baseRootfsPath = path.join(cacheDir, "base.ext4");
+    await writeFile(baseRootfsPath, Buffer.alloc(1024 * 1024));
+
+    const created = await materializePersistentDisk({
+      name: "work",
+      baseRootfsPath,
+      cacheDir,
+      sourceKey: "image-a",
+      diskMiB: 1,
+    });
+
+    const diskPath = path.join(cacheDir, "disks", "work.ext4");
+    const metaPath = path.join(cacheDir, "disks", "work.json");
+    assert.equal(created.rootfsPath, diskPath);
+    assert.equal(created.created, true);
+    assert.equal(await pathExists(diskPath), true);
+    const metadata = JSON.parse(await readFile(metaPath, "utf8"));
+    assert.equal(metadata.kind, "node-vmm-persistent-disk");
+    assert.equal(metadata.name, "work");
+    assert.equal(metadata.sourceKey, "image-a");
+    assert.equal(metadata.sizeMiB, 1);
+
+    const reused = await materializePersistentDisk({
+      name: "work",
+      baseRootfsPath,
+      cacheDir,
+      sourceKey: "image-a",
+      diskMiB: 1,
+    });
+    assert.equal(reused.created, false);
+    assert.equal(reused.resized, false);
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+  }
 });
 
 test("SDK validates attachDisks shape before native runtime setup", () => {
