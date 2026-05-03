@@ -61,14 +61,45 @@ function ensureDir(dir) {
 }
 
 function findVsTool(name) {
-  const candidates = [
+  const roots = [
+    process.env.VCToolsInstallDir ? path.dirname(process.env.VCToolsInstallDir.replace(/[\\/]+$/, "")) : "",
+  ];
+
+  const where = spawnSync("where.exe", [name], { encoding: "utf8" });
+  for (const line of (where.stdout || "").split(/\r?\n/).filter(Boolean)) {
+    if (existsSync(line)) return line;
+  }
+
+  const vswherePath = "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe";
+  if (existsSync(vswherePath)) {
+    const found = spawnSync(
+      vswherePath,
+      [
+        "-latest",
+        "-products",
+        "*",
+        "-requires",
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        "-property",
+        "installationPath",
+      ],
+      { encoding: "utf8" },
+    );
+    for (const line of (found.stdout || "").split(/\r?\n/).filter(Boolean)) {
+      roots.push(path.join(line, "VC", "Tools", "MSVC"));
+    }
+  }
+
+  roots.push(
+    `C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC`,
     `C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC`,
     `C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC`,
     `C:/Program Files (x86)/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC`,
     `C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSVC`,
     `C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC`,
-  ];
-  for (const root of candidates) {
+  );
+
+  for (const root of roots.filter(Boolean)) {
     if (!existsSync(root)) continue;
     const versions = spawnSync("cmd", ["/c", `dir /b "${root.replaceAll("/", "\\")}"`], { encoding: "utf8" });
     const list = (versions.stdout || "").split(/\r?\n/).filter(Boolean).sort().reverse();
